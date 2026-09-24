@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<title>Akashic</title>
+<style>
+  :root {
+    --bg: #f5f4ed; --card: #fbfaf6; --ink: #141413; --muted: #6b6a63; --line: #e3e1d7;
+    --action: #1b365d; --on-action: #ffffff; --soft: #e8ecf2; --ok: #2f6b3b; --warn: #8a5a12;
+    --warn-bg: #f6ecd9; --error: #9b2c2c; --error-bg: #f6e3e1;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --card: #1d1d1b; --ink: #ecebe4; --muted: #9c9b93; --line: #2f2e2b;
+      --action: #a8bdd9; --on-action: #10213a; --soft: #22293a; --ok: #8fc79a; --warn: #e2b66c;
+      --warn-bg: #2d2518; --error: #f0a39c; --error-bg: #34201f;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); }
+  body { font: 16px/1.5 system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  main { min-height: 100%; display: flex; flex-direction: column; padding: 24px 22px 28px; max-width: 520px; margin: 0 auto; }
+  section[data-mode] { display: none; flex: 1; flex-direction: column; }
+  body[data-mode="setup"] section[data-mode="setup"],
+  body[data-mode="onboarding"] section[data-mode="onboarding"],
+  body[data-mode="settings"] section[data-mode="settings"],
+  body[data-mode="offline"] section[data-mode="offline"] { display: flex; }
+  .hero { margin-top: 12vh; }
+  .mark { width: 44px; height: 44px; border-radius: 14px; background: var(--action); color: var(--on-action);
+    display: grid; place-items: center; font-weight: 700; font-size: 22px; margin-bottom: 20px; }
+  h1 { font-size: 26px; line-height: 1.25; margin: 0 0 8px; font-weight: 650; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 26px 4px 8px; letter-spacing: 0.02em; }
+  p { margin: 0; }
+  .lead { color: var(--muted); font-size: 15px; }
+  .spacer { flex: 1; min-height: 24px; }
+  label.field { display: block; margin-top: 28px; font-size: 13px; font-weight: 600; color: var(--muted); }
+  input[type="text"] { display: block; width: 100%; margin-top: 8px; padding: 14px 16px; font: inherit; font-size: 17px;
+    color: var(--ink); background: var(--card); border: 1.5px solid var(--line); border-radius: 14px; outline: none; }
+  input[type="text"]:focus { border-color: var(--action); }
+  input[aria-invalid="true"] { border-color: var(--error); }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .notice { margin-top: 16px; padding: 12px 14px; border-radius: 12px; font-size: 14px; }
+  .notice.error { background: var(--error-bg); color: var(--error); }
+  .notice.warn { background: var(--warn-bg); color: var(--warn); }
+  .notice.ok { background: var(--soft); color: var(--action); }
+  .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 14px 20px; cursor: pointer; }
+  button.primary { background: var(--action); color: var(--on-action); }
+  button.secondary { background: transparent; color: var(--action); }
+  button.small { padding: 8px 14px; font-size: 14px; background: var(--soft); color: var(--action); flex: none; }
+  button.danger { background: transparent; color: var(--error); }
+  button.danger.filled { background: var(--error); color: var(--bg); }
+  button:disabled { opacity: 0.55; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; min-height: 60px; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .row .text { flex: 1; min-width: 0; }
+  .row .title { font-weight: 550; }
+  .row .sub { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .state-ok { color: var(--ok); font-size: 14px; font-weight: 600; flex: none; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); vertical-align: 1px; }
+  .dot.live { background: var(--ok); }
+  .dot.bad { background: var(--error); }
+  .dot.busy { background: var(--warn); }
+  .switch { position: relative; width: 52px; height: 32px; flex: none; }
+  .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; }
+  .switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--line); transition: background .2s; pointer-events: none; }
+  .switch span::after { content: ""; position: absolute; top: 4px; left: 4px; width: 24px; height: 24px; border-radius: 50%;
+    background: var(--bg); transition: transform .2s; }
+  .switch input:checked + span { background: var(--action); }
+  .switch input:checked + span::after { transform: translateX(20px); }
+  .topbar { display: flex; align-items: center; gap: 4px; margin: -8px 0 4px -12px; }
+  .topbar button { padding: 10px 12px; background: transparent; color: var(--ink); font-size: 20px; line-height: 1; }
+  .topbar h1 { margin: 0; font-size: 22px; }
+  .step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--soft); color: var(--action);
+    display: grid; place-items: center; font-size: 14px; font-weight: 700; flex: none; }
+  .foot { text-align: center; font-size: 12px; color: var(--muted); margin-top: 28px; }
+  .confirm { display: none; padding: 0 16px 16px; }
+  .confirm.open { display: block; }
+  .confirm .buttons { display: flex; gap: 8px; margin-top: 12px; }
+  .confirm .buttons button { flex: 1; padding: 11px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body data-mode="setup">
+<main>
+  <section data-mode="setup">
+    <div class="hero">
+      <div class="mark" aria-hidden="true">A</div>
+      <h1 id="setup-title">连接到 Akashic</h1>
+      <p class="lead">输入运行 Akashic 的电脑地址。手机需要和它在同一个网络里。</p>
+    </div>
+    <form id="setup-form" novalidate>
+      <label class="field" for="address">服务器地址</label>
+      <input id="address" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+             placeholder="192.168.0.101:2236" enterkeyhint="go">
+      <p class="hint">写 IP 和端口就可以，默认端口是 2236。</p>
+      <div id="setup-notice" class="notice" role="status" hidden></div>
+      <div class="actions">
+        <button id="connect" class="primary" type="submit">连接</button>
+        <button id="continue-legacy" class="primary" type="button" hidden>仍然继续</button>
+        <button id="setup-cancel" class="secondary" type="button" hidden>取消</button>
+      </div>
+    </form>
+  </section>
+
+  <section data-mode="onboarding">
+    <div class="hero">
+      <h1>及时收到消息</h1>
+      <p class="lead">定时任务、主动消息和耗时较长的回复完成时，Akashic 会像普通应用一样通知你。</p>
+    </div>
+    <h2>需要两项授权</h2>
+    <div class="card">
+      <div class="row">
+        <div class="step-num">1</div>
+        <div class="text"><div class="title">允许通知</div><div class="sub" id="ob-perm-sub">用于显示新消息提醒</div></div>
+        <button class="small" id="ob-perm" type="button">允许</button>
+        <span class="state-ok" id="ob-perm-ok" hidden>已允许</span>
+      </div>
+      <div class="row">
+        <div class="step-num">2</div>
+        <div class="text"><div class="title">允许后台运行</div><div class="sub">关闭电池优化，避免系统在后台断开连接</div></div>
+        <button class="small" id="ob-battery" type="button">允许</button>
+        <span class="state-ok" id="ob-battery-ok" hidden>已允许</span>
+      </div>
+    </div>
+    <p class="hint" style="margin: 14px 4px 0">为了保持连接，通知栏会常驻一条“Akashic · 正在接收新消息”。可以在系统设置里把“后台连接”类别静音，不影响消息提醒。</p>
+    <div class="spacer"></div>
+    <div class="actions">
+      <button id="ob-done" class="primary" type="button">开始使用</button>
+      <button id="ob-skip" class="secondary" type="button">以后再说</button>
+    </div>
+  </section>
+
+  <section data-mode="settings">
+    <div class="topbar">
+      <button id="settings-back" type="button" aria-label="返回">&#8592;</button>
+      <h1>设置</h1>
+    </div>
+
+    <h2>服务器</h2>
+    <div class="card">
+      <div class="row">
+        <div class="text"><div class="title" id="st-server">-</div><div class="sub">当前连接的 Akashic</div></div>
+        <button class="small" id="st-change" type="button">更换</button>
+      </div>
+    </div>
+
+    <h2>通知</h2>
+    <div class="card">
+      <div class="row">
+        <div class="text">
+          <div class="title">接收消息通知</div>
+          <div class="sub" id="st-connection"><span class="dot"></span>通知已关闭</div>
+        </div>
+        <label class="switch"><input id="st-toggle" type="checkbox" aria-label="接收消息通知"><span></span></label>
+      </div>
+      <div class="row">
+        <div class="text"><div class="title">通知权限</div><div class="sub" id="st-perm-sub">-</div></div>
+        <button class="small" id="st-perm" type="button">允许</button>
+      </div>
+      <div class="row">
+        <div class="text"><div class="title">后台运行</div><div class="sub" id="st-battery-sub">-</div></div>
+        <button class="small" id="st-battery" type="button">允许</button>
+      </div>
+    </div>
+
+    <h2>账号</h2>
+    <div class="card">
+      <div class="row">
+        <div class="text"><div class="title">退出登录</div><div class="sub">只影响这台手机，退出后停止接收通知</div></div>
+        <button class="small" id="st-logout" type="button">退出</button>
+      </div>
+      <div class="confirm" id="logout-confirm">
+        <p class="sub">退出后需要重新输入密码才能使用。确定退出吗？</p>
+        <div class="buttons">
+          <button class="danger filled" id="logout-yes" type="button">退出登录</button>
+          <button class="small" id="logout-no" type="button">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="foot">Akashic 外壳 <span id="st-version"></span> · 聊天内容只保存在服务器上<br>长按桌面图标也可以打开这里</p>
+  </section>
+
+  <section data-mode="offline">
+    <div class="hero">
+      <div class="mark" aria-hidden="true">!</div>
+      <h1>暂时连不上 Akashic</h1>
+      <p class="lead" id="off-reason">网络错误</p>
+      <p class="hint" id="off-server"></p>
+      <p class="hint">请确认手机和服务器在同一个网络，并且 Akashic 正在运行。</p>
+    </div>
+    <div class="spacer"></div>
+    <div class="actions">
+      <button id="off-retry" class="primary" type="button">重试</button>
+      <button id="off-change" class="secondary" type="button">更换服务器</button>
+      <button id="off-settings" class="secondary" type="button">设置</button>
+    </div>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var shell = window.AkashicShell;
+  var $ = function (id) { return document.getElementById(id); };
+  var state = {};
+  var pendingLegacy = false;
+
+  function readState() {
+    try { return JSON.parse(shell.state()); } catch (e) { return {}; }
+  }
+
+  function show(el, visible) { el.hidden = !visible; }
+
+  function setNotice(kind, text) {
+    var box = $("setup-notice");
+    box.className = "notice " + kind;
+    box.textContent = text;
+    show(box, !!text);
+  }
+
+  function permissionText(p) {
+    if (p === "granted") return ["已允许", ""];
+    if (p === "prompt") return ["未允许，收不到消息提醒", "允许"];
+    return ["已在系统中关闭", "去设置"];
+  }
+
+  function renderSetup() {
+    var input = $("address");
+    if (!input.value && state.server) input.value = state.server;
+    $("setup-title").textContent = state.hasServer ? "更换服务器" : "连接到 Akashic";
+    show($("setup-cancel"), !!state.hasServer);
+  }
+
+  function renderOnboarding() {
+    var granted = state.permission === "granted";
+    show($("ob-perm"), !granted);
+    show($("ob-perm-ok"), granted);
+    $("ob-perm").textContent = state.permission === "blocked" ? "去设置" : "允许";
+    $("ob-perm-sub").textContent = state.permission === "blocked" ? "通知已在系统中关闭，需要去设置打开" : "用于显示新消息提醒";
+    show($("ob-battery"), !state.batteryUnrestricted);
+    show($("ob-battery-ok"), !!state.batteryUnrestricted);
+    $("ob-done").textContent = granted ? "开始使用" : "先不接收通知，开始使用";
+    show($("ob-skip"), granted);
+  }
+
+  function renderSettings() {
+    $("st-server").textContent = state.server || "未设置";
+    var toggle = $("st-toggle");
+    var granted = state.permission === "granted";
+    toggle.checked = !!state.notificationsWanted && granted;
+    var dot = "dot";
+    var label = state.connectionLabel;
+    if (!granted) { label = "没有通知权限"; dot += " bad"; }
+    else if (!state.notificationsWanted) { label = "通知已关闭"; }
+    else if (state.connection === "LISTENING") { dot += " live"; }
+    else if (state.connection === "SIGNED_OUT" || state.connection === "UNSUPPORTED") { dot += " bad"; }
+    else { dot += " busy"; }
+    $("st-connection").innerHTML = "";
+    var mark = document.createElement("span");
+    mark.className = dot;
+    $("st-connection").append(mark, document.createTextNode(label));
+    var perm = permissionText(state.permission);
+    $("st-perm-sub").textContent = perm[0];
+    $("st-perm").textContent = perm[1] || "管理";
+    $("st-battery-sub").textContent = state.batteryUnrestricted ? "不受限制，后台连接更稳定" : "受电池优化限制，后台可能断开";
+    $("st-battery").textContent = state.batteryUnrestricted ? "管理" : "允许";
+    $("st-version").textContent = state.version || "";
+  }
+
+  function renderOffline() {
+    $("off-reason").textContent = state.offlineReason || "网络错误";
+    $("off-server").textContent = state.server ? "服务器：" + state.server : "";
+  }
+
+  function render(next) {
+    var previous = state.mode;
+    state = next || readState();
+    var mode = state.mode || location.hash.slice(1) || "setup";
+    document.body.dataset.mode = mode;
+    if (mode !== previous) { resetTransient(); window.scrollTo(0, 0); }
+    if (mode === "setup") renderSetup();
+    if (mode === "onboarding") renderOnboarding();
+    if (mode === "settings") renderSettings();
+    if (mode === "offline") renderOffline();
+  }
+
+  function resetTransient() {
+    pendingLegacy = false;
+    setNotice("", "");
+    show($("continue-legacy"), false);
+    $("connect").disabled = false;
+    $("connect").textContent = "连接";
+    $("logout-confirm").classList.remove("open");
+    $("st-logout").disabled = false;
+    $("logout-yes").disabled = false;
+    $("logout-yes").textContent = "退出登录";
+    $("address").removeAttribute("aria-invalid");
+  }
+
+  function onConnectResult(reply) {
+    var button = $("connect");
+    button.disabled = false;
+    button.textContent = "连接";
+    if (!reply.ok) {
+      $("address").setAttribute("aria-invalid", "true");
+      setNotice("error", reply.error);
+      return;
+    }
+    $("address").value = reply.server;
+    if (reply.warning) {
+      pendingLegacy = true;
+      setNotice("warn", reply.warning);
+      show($("continue-legacy"), true);
+      button.textContent = "换个地址再试";
+      return;
+    }
+    setNotice("ok", "已连接 " + reply.server);
+    button.disabled = true;
+    setTimeout(function () { shell.finishSetup(); }, 450);
+  }
+
+  $("setup-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var value = $("address").value.trim();
+    if (!value) {
+      $("address").setAttribute("aria-invalid", "true");
+      setNotice("error", "请先输入服务器地址");
+      return;
+    }
+    pendingLegacy = false;
+    show($("continue-legacy"), false);
+    $("address").removeAttribute("aria-invalid");
+    setNotice("", "");
+    $("connect").disabled = true;
+    $("connect").textContent = "正在连接…";
+    $("address").blur();
+    shell.connect(value);
+  });
+  $("address").addEventListener("input", function () {
+    $("address").removeAttribute("aria-invalid");
+    if (!pendingLegacy) setNotice("", "");
+  });
+  $("continue-legacy").addEventListener("click", function () { shell.finishSetup(); });
+  $("setup-cancel").addEventListener("click", function () { shell.close(); });
+
+  $("ob-perm").addEventListener("click", function () { shell.requestNotificationPermission(); });
+  $("ob-battery").addEventListener("click", function () { shell.requestBatteryExemption(); });
+  $("ob-done").addEventListener("click", function () { shell.finishOnboarding(state.permission === "granted"); });
+  $("ob-skip").addEventListener("click", function () { shell.finishOnboarding(false); });
+
+  $("settings-back").addEventListener("click", function () { shell.close(); });
+  $("st-change").addEventListener("click", function () { $("address").value = ""; shell.changeServer(); });
+  $("st-toggle").addEventListener("change", function (event) {
+    if (event.target.checked && state.permission !== "granted") {
+      event.target.checked = false;
+      shell.requestNotificationPermission();
+      return;
+    }
+    shell.setNotifications(event.target.checked);
+  });
+  $("st-perm").addEventListener("click", function () {
+    if (state.permission === "prompt") shell.requestNotificationPermission();
+    else shell.openNotificationSettings();
+  });
+  $("st-battery").addEventListener("click", function () { shell.requestBatteryExemption(); });
+  $("st-logout").addEventListener("click", function () {
+    $("logout-confirm").classList.add("open");
+    $("st-logout").disabled = true;
+  });
+  $("logout-no").addEventListener("click", function () {
+    $("logout-confirm").classList.remove("open");
+    $("st-logout").disabled = false;
+  });
+  $("logout-yes").addEventListener("click", function () {
+    $("logout-yes").disabled = true;
+    $("logout-yes").textContent = "正在退出…";
+    shell.logout();
+  });
+
+  $("off-retry").addEventListener("click", function () { shell.retry(); });
+  $("off-change").addEventListener("click", function () { $("address").value = ""; shell.changeServer(); });
+  $("off-settings").addEventListener("click", function () { shell.openSettings(); });
+
+  window.shellView = { render: render, onConnectResult: onConnectResult };
+  render();
+})();
+</script>
+</body>
+</html>

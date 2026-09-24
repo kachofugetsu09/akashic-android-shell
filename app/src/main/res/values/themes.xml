@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Shell.Base" parent="@android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@color/paper</item>
+        <item name="android:colorAccent">@color/action</item>
+    </style>
+
+    <style name="Theme.Shell" parent="Theme.Shell.Base" />
+</resources>

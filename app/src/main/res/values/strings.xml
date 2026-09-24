@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Akashic</string>
+    <string name="shortcut_settings">设置</string>
+    <string name="shortcut_settings_long">Akashic 设置</string>
+</resources>
