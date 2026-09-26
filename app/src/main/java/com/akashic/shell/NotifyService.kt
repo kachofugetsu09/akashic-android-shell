@@ -161,7 +161,11 @@ class NotifyService : Service() {
                 require(seq >= 0) { "通知 seq 无效" }
                 val seen = prefs.notificationCursor?.optLong(item.sessionId, -1) ?: -1
                 if (seq > seen) {
-                    check(Notifications.showMessage(this, item)) { "消息通知权限或通知频道已关闭" }
+                    if (!Notifications.showMessage(this, item)) {
+                        running = false
+                        stopSelf()
+                        return false
+                    }
                     prefs.advanceCursor(server, item.sessionId, seq)
                 }
             }

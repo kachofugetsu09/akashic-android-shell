@@ -189,7 +189,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     // granted：可以通知；prompt：还能弹系统授权框；blocked：只能去系统设置里打开。
     private fun notificationPermission(): String {
         if (Notifications.canPost(this)) return "granted"
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return "blocked"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return "blocked"
         val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         if (granted) return "blocked"
         val canAsk = !prefs.notificationAsked || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
@@ -291,7 +292,13 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     }
 
     override fun openNotificationSettings() {
-        launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            intent.action = Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+            intent.putExtra(Settings.EXTRA_CHANNEL_ID, Notifications.CHANNEL_MESSAGES)
+        }
+        launch(intent)
     }
 
     @SuppressLint("BatteryLife")

@@ -60,7 +60,7 @@ object Notifications {
     const val ACTION_OPEN_SESSION = "com.akashic.shell.OPEN_SESSION"
     const val ACTION_SETTINGS = "com.akashic.shell.SETTINGS"
     const val EXTRA_SESSION = "session_id"
-    private const val CHANNEL_MESSAGES = "messages"
+    const val CHANNEL_MESSAGES = "messages"
     private const val CHANNEL_CONNECTION = "connection"
     private const val GROUP = "akashic.messages"
     private val ACCENT = Color.rgb(0x1B, 0x36, 0x5D)
@@ -80,14 +80,15 @@ object Notifications {
     fun canPost(context: Context): Boolean {
         val granted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        return granted && context.getSystemService(NotificationManager::class.java).areNotificationsEnabled()
+        val manager = context.getSystemService(NotificationManager::class.java)
+        return granted && manager.areNotificationsEnabled() &&
+            manager.getNotificationChannel(CHANNEL_MESSAGES).importance != NotificationManager.IMPORTANCE_NONE
     }
 
     // 同一会话只保留最新一条提醒，点击后打开该会话。
     fun showMessage(context: Context, item: NotificationItem): Boolean {
         if (!canPost(context)) return false
         val manager = context.getSystemService(NotificationManager::class.java)
-        if (manager.getNotificationChannel(CHANNEL_MESSAGES).importance == NotificationManager.IMPORTANCE_NONE) return false
         val previous = manager.activeNotifications.firstOrNull { it.tag == item.sessionId }
         if (previous?.notification?.extras?.getString("message_id") == item.messageId) return true
         val intent = Intent(context, MainActivity::class.java)
