@@ -392,16 +392,11 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         return if (session == null) "$server/" else "$server/?session=${Uri.encode(session)}"
     }
 
-    // 页面已加载时在原地切换会话，保留聊天状态；否则带参数重新进入。
+    // 冷启动与热点击都走同一网页导航，不另建跨 iframe 的就绪协议。
     private fun openSession(sessionId: String) {
         val server = prefs.serverUrl ?: return
-        if (panelMode != PanelMode.SETUP && panelMode != null) hidePanel()
-        val fallback = "$server/?session=${Uri.encode(sessionId)}"
-        val view = remote
-        if (view == null || !remoteLoaded) return ensureRemote().loadUrl(fallback)
-        val script = "(function(){try{return !!(window.akashicOpenSession&&window.akashicOpenSession(" +
-            JSONObject.quote(sessionId) + "))}catch(e){return false}})()"
-        view.evaluateJavascript(script) { handled -> if (handled != "true") view.loadUrl(fallback) }
+        if (panelMode != null) hidePanel()
+        ensureRemote().loadUrl("$server/?session=${Uri.encode(sessionId)}")
     }
 
     private fun registerBack() {
