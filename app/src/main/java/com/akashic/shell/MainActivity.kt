@@ -3,6 +3,7 @@ package com.akashic.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -293,8 +294,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun openNotificationSettings() {
         val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+        if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) {
             intent.action = Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
             intent.putExtra(Settings.EXTRA_CHANNEL_ID, Notifications.CHANNEL_MESSAGES)
         }
