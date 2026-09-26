@@ -134,7 +134,11 @@ object Notifications {
             .setShowWhen(false)
             .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, "设置", settings).build())
-            .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
+                }
+            }
             .build()
     }
 }

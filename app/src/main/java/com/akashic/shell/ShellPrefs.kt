@@ -13,24 +13,21 @@ class ShellPrefs(context: Context) {
     val notificationsWanted: Boolean get() = prefs.getBoolean(KEY_WANTED, false)
     val notificationAsked: Boolean get() = prefs.getBoolean(KEY_ASKED, false)
 
-    // 切换服务器时一并丢弃旧服务器的通知游标。
-    @Synchronized
-    fun selectServer(url: String) {
-        if (url == serverUrl) return
-        prefs.edit().putString(KEY_SERVER, url).remove(KEY_CURSOR).apply()
+    // Activity 与 Service 共用同一个 SharedPreferences 锁，切换地址与保存进度不能交错。
+    fun selectServer(url: String) = synchronized(prefs) {
+        if (url == serverUrl) return@synchronized
+        check(prefs.edit().putString(KEY_SERVER, url).remove(KEY_CURSOR).commit()) { "服务器地址保存失败" }
     }
 
-    @Synchronized
-    fun saveCursor(server: String, cursor: JSONObject) {
-        if (server != serverUrl) return
+    fun saveCursor(server: String, cursor: JSONObject) = synchronized(prefs) {
+        if (server != serverUrl) return@synchronized
         check(prefs.edit().putString(KEY_CURSOR, cursor.toString()).commit()) { "通知进度保存失败" }
     }
 
-    @Synchronized
-    fun advanceCursor(server: String, session: String, seq: Long) {
-        if (server != serverUrl) return
+    fun advanceCursor(server: String, session: String, seq: Long) = synchronized(prefs) {
+        if (server != serverUrl) return@synchronized
         val cursor = notificationCursor ?: error("缺少通知起始进度")
-        if (seq <= cursor.optLong(session, -1)) return
+        if (seq <= cursor.optLong(session, -1)) return@synchronized
         cursor.put(session, seq)
         saveCursor(server, cursor)
     }

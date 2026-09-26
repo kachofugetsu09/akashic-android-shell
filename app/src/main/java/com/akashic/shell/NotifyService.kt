@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
 import android.os.IBinder
 import org.json.JSONException
 import org.json.JSONObject
@@ -38,11 +39,12 @@ class NotifyService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(
-            Notifications.ONGOING_ID,
-            Notifications.ongoing(this, ShellStatus.connection),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING,
-        )
+        val notification = Notifications.ongoing(this, ShellStatus.connection)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(Notifications.ONGOING_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+        } else {
+            startForeground(Notifications.ONGOING_ID, notification)
+        }
         if (worker == null) {
             running = true
             if (networkCallback == null) registerNetworkCallback()
@@ -77,6 +79,11 @@ class NotifyService : Service() {
                 return fail(error)
             } catch (error: DateTimeParseException) {
                 return fail(error)
+            }
+            // 地址变化不继承旧服务器的失败或不支持等待。
+            if (server != prefs.serverUrl) {
+                failures = 0
+                continue
             }
             val waitMs = when (outcome) {
                 is StreamOutcome.Dropped -> {
@@ -128,7 +135,7 @@ class NotifyService : Service() {
         val data = StringBuilder()
         try {
             current.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                while (running) {
+                while (running && server == prefs.serverUrl) {
                     val line = reader.readLine() ?: break
                     when {
                         line.isEmpty() -> {

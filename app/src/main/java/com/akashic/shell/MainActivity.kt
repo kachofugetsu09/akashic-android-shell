@@ -225,7 +225,10 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         if (result == ProbeResult.Ready) {
             val changed = prefs.serverUrl != server
             prefs.selectServer(server)
-            if (changed) resetRemote()
+            if (changed) {
+                resetRemote()
+                NotifyService.reconnect(this)
+            }
         }
         deliverConnect(reply)
     }
@@ -412,6 +415,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
     }
 
+    // Android 13+ 已在 registerBack 注册原生回调；这里只保留旧系统入口。
+    @SuppressLint("GestureBackNavigation")
     @Deprecated("Only reached below Android 13; newer versions use OnBackInvokedCallback.")
     override fun onBackPressed() = handleBack()
 
