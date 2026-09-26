@@ -7,7 +7,8 @@ import android.webkit.JavascriptInterface
 // 本地面板能做的全部原生动作；远程页面拿不到这个接口。
 interface PanelHost {
     fun panelState(): String
-    fun connect(address: String)
+    fun connect(address: String, autoConnect: Boolean)
+    fun setAutoConnect(enabled: Boolean)
     fun finishSetup()
     fun closePanel()
     fun changeServer()
@@ -25,7 +26,8 @@ class PanelBridge(private val host: PanelHost) {
     private val main = Handler(Looper.getMainLooper())
 
     @JavascriptInterface fun state(): String = host.panelState()
-    @JavascriptInterface fun connect(address: String) = post { host.connect(address) }
+    @JavascriptInterface fun connect(address: String, autoConnect: Boolean) = post { host.connect(address, autoConnect) }
+    @JavascriptInterface fun setAutoConnect(enabled: Boolean) = post { host.setAutoConnect(enabled) }
     @JavascriptInterface fun finishSetup() = post { host.finishSetup() }
     @JavascriptInterface fun close() = post { host.closePanel() }
     @JavascriptInterface fun changeServer() = post { host.changeServer() }

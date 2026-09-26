@@ -57,14 +57,19 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
             showPanel(PanelMode.SETUP)
             return
         }
-        ensureRemote().loadUrl(entryUrl(server, intent))
-        if (intent?.action == Notifications.ACTION_SETTINGS) showPanel(PanelMode.SETTINGS)
+        when {
+            intent?.action == Notifications.ACTION_SETTINGS -> showPanel(PanelMode.SETTINGS)
+            intent?.action == Notifications.ACTION_OPEN_SESSION || prefs.autoConnect ->
+                ensureRemote().loadUrl(entryUrl(server, intent))
+            else -> showPanel(PanelMode.SETUP)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         when (intent.action) {
+            Intent.ACTION_MAIN -> if (!prefs.autoConnect) showPanel(PanelMode.SETUP)
             Notifications.ACTION_SETTINGS -> if (prefs.serverUrl != null) showPanel(PanelMode.SETTINGS)
             Notifications.ACTION_OPEN_SESSION -> intent.getStringExtra(Notifications.EXTRA_SESSION)?.let(::openSession)
         }
@@ -176,7 +181,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun panelState(): String = JSONObject()
         .put("mode", panelMode?.id ?: "")
-        .put("server", prefs.serverUrl?.let(Server::label) ?: "")
+        .put("server", prefs.serverUrl ?: "")
+        .put("autoConnect", prefs.autoConnect)
         .put("hasServer", prefs.serverUrl != null && remoteLoaded)
         .put("offlineReason", offlineReason)
         .put("permission", notificationPermission())
@@ -200,31 +206,31 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     // ---- PanelHost：连接服务器 ----
 
-    override fun connect(address: String) {
+    override fun connect(address: String, autoConnect: Boolean) {
         val normalized = Server.normalize(address)
         if (normalized == null) {
-            deliverConnect(JSONObject().put("ok", false).put("error", "地址格式不对，可以写成 192.168.0.101:2236"))
+            deliverConnect(JSONObject().put("ok", false).put("error", "请输入完整服务器地址，如 https://your-server.example 或 http://服务器IP:2236"))
             return
         }
         background.execute {
             val result = Server.probe(normalized)
-            runOnUiThread { onProbe(normalized, result) }
+            runOnUiThread { onProbe(normalized, autoConnect, result) }
         }
     }
 
-    private fun onProbe(server: String, result: ProbeResult) {
+    private fun onProbe(server: String, autoConnect: Boolean, result: ProbeResult) {
         val label = Server.label(server)
-        val reply = JSONObject().put("server", label)
+        val reply = JSONObject().put("server", server)
         when (result) {
             ProbeResult.Ready -> reply.put("ok", true)
             ProbeResult.NotAkashic -> reply.put("ok", false)
                 .put("error", "$label 有响应，但不是 Akashic。请检查端口，默认是 2236。")
             is ProbeResult.Unreachable -> reply.put("ok", false)
-                .put("error", "连不上 $label：${result.reason}。请确认手机和服务器在同一个网络，并且 Akashic 正在运行。")
+                .put("error", "连不上 $label：${result.reason}。请确认当前网络能访问该地址，并且 Akashic 正在运行。")
         }
         if (result == ProbeResult.Ready) {
             val changed = prefs.serverUrl != server
-            prefs.selectServer(server)
+            prefs.selectServer(server, autoConnect)
             if (changed) {
                 resetRemote()
                 NotifyService.reconnect(this)
@@ -235,6 +241,11 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     private fun deliverConnect(reply: JSONObject) {
         panel.evaluateJavascript("window.shellView && shellView.onConnectResult($reply)", null)
+    }
+
+    override fun setAutoConnect(enabled: Boolean) {
+        prefs.setAutoConnect(enabled)
+        refreshPanel()
     }
 
     override fun finishSetup() {
@@ -250,6 +261,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
             panelMode == PanelMode.SETUP && prefs.serverUrl == null -> finish()
             offlineReason.isNotEmpty() -> showPanel(PanelMode.OFFLINE)
             panelMode == PanelMode.SETUP && !remoteLoaded -> finish()
+            !remoteLoaded -> showPanel(PanelMode.SETUP)
             else -> hidePanel()
         }
     }

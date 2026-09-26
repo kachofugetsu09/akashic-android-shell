@@ -91,13 +91,15 @@
     <div class="hero">
       <div class="mark" aria-hidden="true">A</div>
       <h1 id="setup-title">连接到 Akashic</h1>
-      <p class="lead">输入运行 Akashic 的电脑地址。手机需要和它在同一个网络里。</p>
+      <p class="lead">输入服务器地址，或确认上次保存的地址。</p>
     </div>
     <form id="setup-form" novalidate>
       <label class="field" for="address">服务器地址</label>
       <input id="address" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
-             placeholder="192.168.0.101:2236" enterkeyhint="go">
-      <p class="hint">写 IP 和端口就可以，默认端口是 2236。</p>
+             placeholder="https://your-server.example" enterkeyhint="go">
+      <p class="hint">公网地址请填写完整的 https:// 地址；局域网可以填写 IP 和端口，默认端口为 2236。</p>
+      <label class="row"><input id="auto-connect" type="checkbox">下次自动连接</label>
+      <p class="hint">不勾选时，每次打开应用先确认地址；已开启的后台消息通知不受影响。</p>
       <div id="setup-notice" class="notice" role="status" hidden></div>
       <div class="actions">
         <button id="connect" class="primary" type="submit">连接</button>
@@ -147,6 +149,10 @@
         <div class="text"><div class="title" id="st-server">-</div><div class="sub">当前连接的 Akashic</div></div>
         <button class="small" id="st-change" type="button">更换</button>
       </div>
+      <div class="row">
+        <div class="text"><div class="title">打开应用时自动连接</div><div class="sub">关闭后，先确认服务器地址</div></div>
+        <label class="switch"><input id="st-auto-connect" type="checkbox" aria-label="打开应用时自动连接"><span></span></label>
+      </div>
     </div>
 
     <h2>通知</h2>
@@ -177,7 +183,7 @@
       <h1>暂时连不上 Akashic</h1>
       <p class="lead" id="off-reason">网络错误</p>
       <p class="hint" id="off-server"></p>
-      <p class="hint">请确认手机和服务器在同一个网络，并且 Akashic 正在运行。</p>
+      <p class="hint">请确认当前网络能访问该地址，并且 Akashic 正在运行。</p>
     </div>
     <div class="spacer"></div>
     <div class="actions">
@@ -213,9 +219,11 @@
     return ["已在系统中关闭", "去设置"];
   }
 
-  function renderSetup() {
-    var input = $("address");
-    if (!input.value && state.server) input.value = state.server;
+  function renderSetup(entering) {
+    if (entering) {
+      $("address").value = state.server || "";
+      $("auto-connect").checked = !!state.autoConnect;
+    }
     $("setup-title").textContent = state.hasServer ? "更换服务器" : "连接到 Akashic";
     show($("setup-cancel"), !!state.hasServer);
   }
@@ -234,6 +242,7 @@
 
   function renderSettings() {
     $("st-server").textContent = state.server || "未设置";
+    $("st-auto-connect").checked = !!state.autoConnect;
     var toggle = $("st-toggle");
     var granted = state.permission === "granted";
     toggle.checked = !!state.notificationsWanted && granted;
@@ -267,7 +276,7 @@
     var mode = state.mode || location.hash.slice(1) || "setup";
     document.body.dataset.mode = mode;
     if (mode !== previous) { resetTransient(); window.scrollTo(0, 0); }
-    if (mode === "setup") renderSetup();
+    if (mode === "setup") renderSetup(mode !== previous);
     if (mode === "onboarding") renderOnboarding();
     if (mode === "settings") renderSettings();
     if (mode === "offline") renderOffline();
@@ -308,7 +317,7 @@
     $("connect").disabled = true;
     $("connect").textContent = "正在连接…";
     $("address").blur();
-    shell.connect(value);
+    shell.connect(value, $("auto-connect").checked);
   });
   $("address").addEventListener("input", function () {
     $("address").removeAttribute("aria-invalid");
@@ -322,6 +331,7 @@
 
   $("settings-back").addEventListener("click", function () { shell.close(); });
   $("st-change").addEventListener("click", function () { $("address").value = ""; shell.changeServer(); });
+  $("st-auto-connect").addEventListener("change", function (event) { shell.setAutoConnect(event.target.checked); });
   $("st-toggle").addEventListener("change", function (event) {
     if (event.target.checked && state.permission !== "granted") {
       event.target.checked = false;
