@@ -101,7 +101,7 @@
       <div id="setup-notice" class="notice" role="status" hidden></div>
       <div class="actions">
         <button id="connect" class="primary" type="submit">连接</button>
-        <button id="continue-legacy" class="primary" type="button" hidden>仍然继续</button>
+
         <button id="setup-cancel" class="secondary" type="button" hidden>取消</button>
       </div>
     </form>
@@ -110,7 +110,7 @@
   <section data-mode="onboarding">
     <div class="hero">
       <h1>及时收到消息</h1>
-      <p class="lead">定时任务、主动消息和耗时较长的回复完成时，Akashic 会像普通应用一样通知你。</p>
+      <p class="lead">定时任务、主动消息和耗时较长的回复完成时，Akashic 可在后台提醒你；需要服务器支持通知，且手机能访问服务器。</p>
     </div>
     <h2>需要两项授权</h2>
     <div class="card">
@@ -122,7 +122,7 @@
       </div>
       <div class="row">
         <div class="step-num">2</div>
-        <div class="text"><div class="title">允许后台运行</div><div class="sub">关闭电池优化，避免系统在后台断开连接</div></div>
+        <div class="text"><div class="title">允许后台运行</div><div class="sub">允许后台运行，减少锁屏时的连接中断</div></div>
         <button class="small" id="ob-battery" type="button">允许</button>
         <span class="state-ok" id="ob-battery-ok" hidden>已允许</span>
       </div>
@@ -168,21 +168,6 @@
       </div>
     </div>
 
-    <h2>账号</h2>
-    <div class="card">
-      <div class="row">
-        <div class="text"><div class="title">退出登录</div><div class="sub">只影响这台手机，退出后停止接收通知</div></div>
-        <button class="small" id="st-logout" type="button">退出</button>
-      </div>
-      <div class="confirm" id="logout-confirm">
-        <p class="sub">退出后需要重新输入密码才能使用。确定退出吗？</p>
-        <div class="buttons">
-          <button class="danger filled" id="logout-yes" type="button">退出登录</button>
-          <button class="small" id="logout-no" type="button">取消</button>
-        </div>
-      </div>
-    </div>
-
     <p class="foot">Akashic 外壳 <span id="st-version"></span> · 聊天内容只保存在服务器上<br>长按桌面图标也可以打开这里</p>
   </section>
 
@@ -208,7 +193,6 @@
   var shell = window.AkashicShell;
   var $ = function (id) { return document.getElementById(id); };
   var state = {};
-  var pendingLegacy = false;
 
   function readState() {
     try { return JSON.parse(shell.state()); } catch (e) { return {}; }
@@ -258,7 +242,7 @@
     if (!granted) { label = "没有通知权限"; dot += " bad"; }
     else if (!state.notificationsWanted) { label = "通知已关闭"; }
     else if (state.connection === "LISTENING") { dot += " live"; }
-    else if (state.connection === "SIGNED_OUT" || state.connection === "UNSUPPORTED") { dot += " bad"; }
+    else if (state.connection === "FAILED" || state.connection === "UNSUPPORTED") { dot += " bad"; }
     else { dot += " busy"; }
     $("st-connection").innerHTML = "";
     var mark = document.createElement("span");
@@ -290,15 +274,9 @@
   }
 
   function resetTransient() {
-    pendingLegacy = false;
     setNotice("", "");
-    show($("continue-legacy"), false);
     $("connect").disabled = false;
     $("connect").textContent = "连接";
-    $("logout-confirm").classList.remove("open");
-    $("st-logout").disabled = false;
-    $("logout-yes").disabled = false;
-    $("logout-yes").textContent = "退出登录";
     $("address").removeAttribute("aria-invalid");
   }
 
@@ -312,13 +290,6 @@
       return;
     }
     $("address").value = reply.server;
-    if (reply.warning) {
-      pendingLegacy = true;
-      setNotice("warn", reply.warning);
-      show($("continue-legacy"), true);
-      button.textContent = "换个地址再试";
-      return;
-    }
     setNotice("ok", "已连接 " + reply.server);
     button.disabled = true;
     setTimeout(function () { shell.finishSetup(); }, 450);
@@ -332,8 +303,6 @@
       setNotice("error", "请先输入服务器地址");
       return;
     }
-    pendingLegacy = false;
-    show($("continue-legacy"), false);
     $("address").removeAttribute("aria-invalid");
     setNotice("", "");
     $("connect").disabled = true;
@@ -343,9 +312,7 @@
   });
   $("address").addEventListener("input", function () {
     $("address").removeAttribute("aria-invalid");
-    if (!pendingLegacy) setNotice("", "");
   });
-  $("continue-legacy").addEventListener("click", function () { shell.finishSetup(); });
   $("setup-cancel").addEventListener("click", function () { shell.close(); });
 
   $("ob-perm").addEventListener("click", function () { shell.requestNotificationPermission(); });
@@ -368,20 +335,6 @@
     else shell.openNotificationSettings();
   });
   $("st-battery").addEventListener("click", function () { shell.requestBatteryExemption(); });
-  $("st-logout").addEventListener("click", function () {
-    $("logout-confirm").classList.add("open");
-    $("st-logout").disabled = true;
-  });
-  $("logout-no").addEventListener("click", function () {
-    $("logout-confirm").classList.remove("open");
-    $("st-logout").disabled = false;
-  });
-  $("logout-yes").addEventListener("click", function () {
-    $("logout-yes").disabled = true;
-    $("logout-yes").textContent = "正在退出…";
-    shell.logout();
-  });
-
   $("off-retry").addEventListener("click", function () { shell.retry(); });
   $("off-change").addEventListener("click", function () { $("address").value = ""; shell.changeServer(); });
   $("off-settings").addEventListener("click", function () { shell.openSettings(); });

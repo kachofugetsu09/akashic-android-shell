@@ -18,7 +18,6 @@ interface PanelHost {
     fun requestBatteryExemption()
     fun finishOnboarding(enable: Boolean)
     fun setNotifications(enable: Boolean)
-    fun logout()
 }
 
 // JS 回调运行在 WebView 的桥线程上，这里统一切回主线程。
@@ -37,7 +36,6 @@ class PanelBridge(private val host: PanelHost) {
     @JavascriptInterface fun requestBatteryExemption() = post { host.requestBatteryExemption() }
     @JavascriptInterface fun finishOnboarding(enable: Boolean) = post { host.finishOnboarding(enable) }
     @JavascriptInterface fun setNotifications(enable: Boolean) = post { host.setNotifications(enable) }
-    @JavascriptInterface fun logout() = post { host.logout() }
 
     private fun post(action: () -> Unit) {
         main.post(action)

@@ -20,13 +20,12 @@ enum class ConnectionState(val label: String) {
     CONNECTING("正在连接…"),
     LISTENING("正在接收新消息"),
     RETRYING("连接中断，正在重试"),
-    SIGNED_OUT("需要重新登录，点按打开 Akashic"),
+    FAILED("通知数据异常，请查看日志并重新连接"),
     UNSUPPORTED("服务器版本暂不支持通知"),
 }
 
 // 进程内共享的壳状态：前台可见性和通知连接状态。
 object ShellStatus {
-    @Volatile var appVisible = false
     @Volatile var connection = ConnectionState.STOPPED
         private set
     var listener: (() -> Unit)? = null
@@ -46,14 +45,12 @@ data class NotificationItem(
     val recordedAt: Long,
 ) {
     companion object {
-        fun from(json: JSONObject): NotificationItem? {
-            val sessionId = json.optString("session_id")
-            val messageId = json.optString("message_id")
-            if (sessionId.isEmpty() || messageId.isEmpty()) return null
-            val recordedAt = runCatching {
-                OffsetDateTime.parse(json.optString("recorded_at")).toInstant().toEpochMilli()
-            }.getOrDefault(System.currentTimeMillis())
-            return NotificationItem(sessionId, messageId, json.optString("title", "Akashic"), json.optString("preview"), recordedAt)
+        fun from(json: JSONObject): NotificationItem {
+            val sessionId = json.getString("session_id")
+            val messageId = json.getString("message_id")
+            require(sessionId.isNotEmpty() && messageId.isNotEmpty()) { "通知消息身份不能为空" }
+            val recordedAt = OffsetDateTime.parse(json.getString("recorded_at")).toInstant().toEpochMilli()
+            return NotificationItem(sessionId, messageId, json.getString("title"), json.getString("preview"), recordedAt)
         }
     }
 }
@@ -87,14 +84,19 @@ object Notifications {
     }
 
     // 同一会话只保留最新一条提醒，点击后打开该会话。
-    fun showMessage(context: Context, item: NotificationItem) {
-        if (!canPost(context)) return
+    fun showMessage(context: Context, item: NotificationItem): Boolean {
+        if (!canPost(context)) return false
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (manager.getNotificationChannel(CHANNEL_MESSAGES).importance == NotificationManager.IMPORTANCE_NONE) return false
+        val previous = manager.activeNotifications.firstOrNull { it.tag == item.sessionId }
+        if (previous?.notification?.extras?.getString("message_id") == item.messageId) return true
         val intent = Intent(context, MainActivity::class.java)
             .setAction(ACTION_OPEN_SESSION)
+            .setData(android.net.Uri.Builder().scheme("akashic").authority("session").appendPath(item.sessionId).build())
             .putExtra(EXTRA_SESSION, item.sessionId)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pending = PendingIntent.getActivity(
-            context, item.sessionId.hashCode(), intent,
+            context, 0, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification = Notification.Builder(context, CHANNEL_MESSAGES)
@@ -108,15 +110,11 @@ object Notifications {
             .setCategory(Notification.CATEGORY_MESSAGE)
             .setGroup(GROUP)
             .setAutoCancel(true)
+            .addExtras(android.os.Bundle().apply { putString("message_id", item.messageId) })
             .setContentIntent(pending)
             .build()
-        context.getSystemService(NotificationManager::class.java).notify(item.sessionId.hashCode(), notification)
-    }
-
-    // 回到前台即视为已看到，只清除消息提醒，保留常驻通知。
-    fun clearMessages(context: Context) {
-        val manager = context.getSystemService(NotificationManager::class.java)
-        manager.activeNotifications.filter { it.id != ONGOING_ID }.forEach { manager.cancel(it.tag, it.id) }
+        manager.notify(item.sessionId, 2, notification)
+        return true
     }
 
     fun ongoing(context: Context, state: ConnectionState): Notification {

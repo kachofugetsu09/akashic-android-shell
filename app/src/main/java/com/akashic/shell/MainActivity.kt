@@ -40,7 +40,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     @Volatile private var panelMode: PanelMode? = null
     @Volatile private var offlineReason = ""
     private var remoteLoaded = false
-    private var lastPath: String? = null
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val background = Executors.newSingleThreadExecutor()
 
@@ -72,16 +71,13 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun onResume() {
         super.onResume()
-        ShellStatus.appVisible = true
         ShellStatus.listener = ::refreshPanel
-        Notifications.clearMessages(this)
         NotifyService.sync(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()
     }
 
     override fun onPause() {
-        ShellStatus.appVisible = false
         ShellStatus.listener = null
         CookieManager.getInstance().flush()
         super.onPause()
@@ -218,15 +214,13 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         val label = Server.label(server)
         val reply = JSONObject().put("server", label)
         when (result) {
-            is ProbeResult.Ready -> reply.put("ok", true)
-            ProbeResult.Legacy -> reply.put("ok", true)
-                .put("warning", "这台服务器上的 Akashic 版本较旧：可以正常聊天，但还不支持登录保护和消息通知。")
+            ProbeResult.Ready -> reply.put("ok", true)
             ProbeResult.NotAkashic -> reply.put("ok", false)
                 .put("error", "$label 有响应，但不是 Akashic。请检查端口，默认是 2236。")
             is ProbeResult.Unreachable -> reply.put("ok", false)
                 .put("error", "连不上 $label：${result.reason}。请确认手机和服务器在同一个网络，并且 Akashic 正在运行。")
         }
-        if (result is ProbeResult.Ready || result == ProbeResult.Legacy) {
+        if (result == ProbeResult.Ready) {
             val changed = prefs.serverUrl != server
             prefs.selectServer(server)
             if (changed) resetRemote()
@@ -273,7 +267,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         remote = null
         remoteLoaded = false
-        lastPath = null
     }
 
     // ---- PanelHost：通知与后台 ----
@@ -324,23 +317,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         refreshPanel()
     }
 
-    // 先让服务器作废会话，再清本机 Cookie，最后回到登录页。
-    override fun logout() {
-        val server = prefs.serverUrl ?: return
-        stopService(Intent(this, NotifyService::class.java))
-        background.execute {
-            Server.logout(server)
-            runOnUiThread {
-                CookieManager.getInstance().removeAllCookies {
-                    CookieManager.getInstance().flush()
-                    hidePanel()
-                    resetRemote()
-                    ensureRemote().loadUrl("$server/")
-                }
-            }
-        }
-    }
-
     private fun launch(intent: Intent): Boolean = try {
         startActivity(intent)
         true
@@ -356,11 +332,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         remoteLoaded = true
         offlineReason = ""
         if (panelMode == PanelMode.OFFLINE) hidePanel()
-        val path = url.path.orEmpty()
-        val leftLogin = lastPath == "/login" && path != "/login"
-        lastPath = path
-        if (path == "/login" || path == "/logout") return syncBarsWithPage()
-        if (leftLogin) NotifyService.reconnect(this)
         if (!prefs.onboardingDone && panelMode == null) showPanel(PanelMode.ONBOARDING) else syncBarsWithPage()
     }
 
