@@ -1,7 +1,6 @@
 package com.akashic.shell
 
 import android.net.Uri
-import android.webkit.CookieManager
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
@@ -13,8 +12,7 @@ import java.net.URL
 import java.net.UnknownHostException
 
 sealed interface ProbeResult {
-    data class Ready(val authRequired: Boolean, val authenticated: Boolean) : ProbeResult
-    data object Legacy : ProbeResult
+    data object Ready : ProbeResult
     data object NotAkashic : ProbeResult
     data class Unreachable(val reason: String) : ProbeResult
 }
@@ -54,40 +52,14 @@ object Server {
         else -> 80
     }
 
-    // 阻塞调用：确认地址上运行的是 Akashic，并读取登录状态。
+    // 聊天是否可用独立于通知能力，不用认证接口判断服务器版本。
     fun probe(server: String): ProbeResult = try {
-        val (code, body) = get("$server/api/auth/status")
-        when {
-            code == 200 -> parseStatus(body)
-            code == 404 && get("$server/api/shell/state").first == 200 -> ProbeResult.Legacy
-            else -> ProbeResult.NotAkashic
-        }
+        val (code, body) = get("$server/api/shell/state")
+        if (code == 200 && JSONObject(body).has("chatReady")) ProbeResult.Ready else ProbeResult.NotAkashic
     } catch (error: IOException) {
         ProbeResult.Unreachable(describe(error))
-    }
-
-    private fun parseStatus(body: String): ProbeResult = try {
-        val json = JSONObject(body)
-        if (!json.has("auth_required")) {
-            ProbeResult.NotAkashic
-        } else {
-            ProbeResult.Ready(json.getBoolean("auth_required"), json.optBoolean("authenticated"))
-        }
     } catch (_: JSONException) {
         ProbeResult.NotAkashic
-    }
-
-    // 退出只影响本机会话；网络失败时本地 Cookie 仍会被清除。
-    fun logout(server: String) {
-        try {
-            val connection = open("$server/api/auth/logout")
-            connection.requestMethod = "POST"
-            connection.doOutput = true
-            connection.outputStream.use { it.write(ByteArray(0)) }
-            connection.responseCode
-            connection.disconnect()
-        } catch (_: IOException) {
-        }
     }
 
     fun open(url: String, readTimeoutMs: Int = TIMEOUT_MS): HttpURLConnection {
@@ -96,7 +68,6 @@ object Server {
         connection.readTimeout = readTimeoutMs
         connection.instanceFollowRedirects = false
         connection.setRequestProperty("Accept", "application/json")
-        CookieManager.getInstance().getCookie(url)?.let { connection.setRequestProperty("Cookie", it) }
         return connection
     }
 

@@ -3,6 +3,7 @@ package com.akashic.shell
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.NotificationManager
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -40,7 +41,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     @Volatile private var panelMode: PanelMode? = null
     @Volatile private var offlineReason = ""
     private var remoteLoaded = false
-    private var lastPath: String? = null
     private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val background = Executors.newSingleThreadExecutor()
 
@@ -57,14 +57,19 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
             showPanel(PanelMode.SETUP)
             return
         }
-        ensureRemote().loadUrl(entryUrl(server, intent))
-        if (intent?.action == Notifications.ACTION_SETTINGS) showPanel(PanelMode.SETTINGS)
+        when {
+            intent?.action == Notifications.ACTION_SETTINGS -> showPanel(PanelMode.SETTINGS)
+            intent?.action == Notifications.ACTION_OPEN_SESSION || prefs.autoConnect ->
+                ensureRemote().loadUrl(entryUrl(server, intent))
+            else -> showPanel(PanelMode.SETUP)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         when (intent.action) {
+            Intent.ACTION_MAIN -> if (!prefs.autoConnect) showPanel(PanelMode.SETUP)
             Notifications.ACTION_SETTINGS -> if (prefs.serverUrl != null) showPanel(PanelMode.SETTINGS)
             Notifications.ACTION_OPEN_SESSION -> intent.getStringExtra(Notifications.EXTRA_SESSION)?.let(::openSession)
         }
@@ -72,16 +77,13 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun onResume() {
         super.onResume()
-        ShellStatus.appVisible = true
         ShellStatus.listener = ::refreshPanel
-        Notifications.clearMessages(this)
         NotifyService.sync(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()
     }
 
     override fun onPause() {
-        ShellStatus.appVisible = false
         ShellStatus.listener = null
         CookieManager.getInstance().flush()
         super.onPause()
@@ -179,7 +181,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun panelState(): String = JSONObject()
         .put("mode", panelMode?.id ?: "")
-        .put("server", prefs.serverUrl?.let(Server::label) ?: "")
+        .put("server", prefs.serverUrl ?: "")
+        .put("autoConnect", prefs.autoConnect)
         .put("hasServer", prefs.serverUrl != null && remoteLoaded)
         .put("offlineReason", offlineReason)
         .put("permission", notificationPermission())
@@ -193,7 +196,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     // granted：可以通知；prompt：还能弹系统授权框；blocked：只能去系统设置里打开。
     private fun notificationPermission(): String {
         if (Notifications.canPost(this)) return "granted"
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return "blocked"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return "blocked"
         val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         if (granted) return "blocked"
         val canAsk = !prefs.notificationAsked || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)
@@ -202,40 +206,46 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     // ---- PanelHost：连接服务器 ----
 
-    override fun connect(address: String) {
+    override fun connect(address: String, autoConnect: Boolean) {
         val normalized = Server.normalize(address)
         if (normalized == null) {
-            deliverConnect(JSONObject().put("ok", false).put("error", "地址格式不对，可以写成 192.168.0.101:2236"))
+            deliverConnect(JSONObject().put("ok", false).put("error", "请输入完整服务器地址，如 https://your-server.example 或 http://服务器IP:2236"))
             return
         }
         background.execute {
             val result = Server.probe(normalized)
-            runOnUiThread { onProbe(normalized, result) }
+            runOnUiThread { onProbe(normalized, autoConnect, result) }
         }
     }
 
-    private fun onProbe(server: String, result: ProbeResult) {
+    private fun onProbe(server: String, autoConnect: Boolean, result: ProbeResult) {
         val label = Server.label(server)
-        val reply = JSONObject().put("server", label)
+        val reply = JSONObject().put("server", server)
         when (result) {
-            is ProbeResult.Ready -> reply.put("ok", true)
-            ProbeResult.Legacy -> reply.put("ok", true)
-                .put("warning", "这台服务器上的 Akashic 版本较旧：可以正常聊天，但还不支持登录保护和消息通知。")
+            ProbeResult.Ready -> reply.put("ok", true)
             ProbeResult.NotAkashic -> reply.put("ok", false)
                 .put("error", "$label 有响应，但不是 Akashic。请检查端口，默认是 2236。")
             is ProbeResult.Unreachable -> reply.put("ok", false)
-                .put("error", "连不上 $label：${result.reason}。请确认手机和服务器在同一个网络，并且 Akashic 正在运行。")
+                .put("error", "连不上 $label：${result.reason}。请确认当前网络能访问该地址，并且 Akashic 正在运行。")
         }
-        if (result is ProbeResult.Ready || result == ProbeResult.Legacy) {
+        if (result == ProbeResult.Ready) {
             val changed = prefs.serverUrl != server
-            prefs.selectServer(server)
-            if (changed) resetRemote()
+            prefs.selectServer(server, autoConnect)
+            if (changed) {
+                resetRemote()
+                NotifyService.reconnect(this)
+            }
         }
         deliverConnect(reply)
     }
 
     private fun deliverConnect(reply: JSONObject) {
         panel.evaluateJavascript("window.shellView && shellView.onConnectResult($reply)", null)
+    }
+
+    override fun setAutoConnect(enabled: Boolean) {
+        prefs.setAutoConnect(enabled)
+        refreshPanel()
     }
 
     override fun finishSetup() {
@@ -251,6 +261,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
             panelMode == PanelMode.SETUP && prefs.serverUrl == null -> finish()
             offlineReason.isNotEmpty() -> showPanel(PanelMode.OFFLINE)
             panelMode == PanelMode.SETUP && !remoteLoaded -> finish()
+            !remoteLoaded -> showPanel(PanelMode.SETUP)
             else -> hidePanel()
         }
     }
@@ -273,7 +284,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         remote = null
         remoteLoaded = false
-        lastPath = null
     }
 
     // ---- PanelHost：通知与后台 ----
@@ -298,7 +308,12 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     }
 
     override fun openNotificationSettings() {
-        launch(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) {
+            intent.action = Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+            intent.putExtra(Settings.EXTRA_CHANNEL_ID, Notifications.CHANNEL_MESSAGES)
+        }
+        launch(intent)
     }
 
     @SuppressLint("BatteryLife")
@@ -324,23 +339,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         refreshPanel()
     }
 
-    // 先让服务器作废会话，再清本机 Cookie，最后回到登录页。
-    override fun logout() {
-        val server = prefs.serverUrl ?: return
-        stopService(Intent(this, NotifyService::class.java))
-        background.execute {
-            Server.logout(server)
-            runOnUiThread {
-                CookieManager.getInstance().removeAllCookies {
-                    CookieManager.getInstance().flush()
-                    hidePanel()
-                    resetRemote()
-                    ensureRemote().loadUrl("$server/")
-                }
-            }
-        }
-    }
-
     private fun launch(intent: Intent): Boolean = try {
         startActivity(intent)
         true
@@ -356,11 +354,6 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         remoteLoaded = true
         offlineReason = ""
         if (panelMode == PanelMode.OFFLINE) hidePanel()
-        val path = url.path.orEmpty()
-        val leftLogin = lastPath == "/login" && path != "/login"
-        lastPath = path
-        if (path == "/login" || path == "/logout") return syncBarsWithPage()
-        if (leftLogin) NotifyService.reconnect(this)
         if (!prefs.onboardingDone && panelMode == null) showPanel(PanelMode.ONBOARDING) else syncBarsWithPage()
     }
 
@@ -421,16 +414,11 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         return if (session == null) "$server/" else "$server/?session=${Uri.encode(session)}"
     }
 
-    // 页面已加载时在原地切换会话，保留聊天状态；否则带参数重新进入。
+    // 冷启动与热点击都走同一网页导航，不另建跨 iframe 的就绪协议。
     private fun openSession(sessionId: String) {
         val server = prefs.serverUrl ?: return
-        if (panelMode != PanelMode.SETUP && panelMode != null) hidePanel()
-        val fallback = "$server/?session=${Uri.encode(sessionId)}"
-        val view = remote
-        if (view == null || !remoteLoaded) return ensureRemote().loadUrl(fallback)
-        val script = "(function(){try{return !!(window.akashicOpenSession&&window.akashicOpenSession(" +
-            JSONObject.quote(sessionId) + "))}catch(e){return false}})()"
-        view.evaluateJavascript(script) { handled -> if (handled != "true") view.loadUrl(fallback) }
+        if (panelMode != null) hidePanel()
+        ensureRemote().loadUrl("$server/?session=${Uri.encode(sessionId)}")
     }
 
     private fun registerBack() {
@@ -439,6 +427,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
     }
 
+    // Android 13+ 已在 registerBack 注册原生回调；这里只保留旧系统入口。
+    @SuppressLint("GestureBackNavigation")
     @Deprecated("Only reached below Android 13; newer versions use OnBackInvokedCallback.")
     override fun onBackPressed() = handleBack()
 

@@ -7,7 +7,8 @@ import android.webkit.JavascriptInterface
 // 本地面板能做的全部原生动作；远程页面拿不到这个接口。
 interface PanelHost {
     fun panelState(): String
-    fun connect(address: String)
+    fun connect(address: String, autoConnect: Boolean)
+    fun setAutoConnect(enabled: Boolean)
     fun finishSetup()
     fun closePanel()
     fun changeServer()
@@ -18,7 +19,6 @@ interface PanelHost {
     fun requestBatteryExemption()
     fun finishOnboarding(enable: Boolean)
     fun setNotifications(enable: Boolean)
-    fun logout()
 }
 
 // JS 回调运行在 WebView 的桥线程上，这里统一切回主线程。
@@ -26,7 +26,8 @@ class PanelBridge(private val host: PanelHost) {
     private val main = Handler(Looper.getMainLooper())
 
     @JavascriptInterface fun state(): String = host.panelState()
-    @JavascriptInterface fun connect(address: String) = post { host.connect(address) }
+    @JavascriptInterface fun connect(address: String, autoConnect: Boolean) = post { host.connect(address, autoConnect) }
+    @JavascriptInterface fun setAutoConnect(enabled: Boolean) = post { host.setAutoConnect(enabled) }
     @JavascriptInterface fun finishSetup() = post { host.finishSetup() }
     @JavascriptInterface fun close() = post { host.closePanel() }
     @JavascriptInterface fun changeServer() = post { host.changeServer() }
@@ -37,7 +38,6 @@ class PanelBridge(private val host: PanelHost) {
     @JavascriptInterface fun requestBatteryExemption() = post { host.requestBatteryExemption() }
     @JavascriptInterface fun finishOnboarding(enable: Boolean) = post { host.finishOnboarding(enable) }
     @JavascriptInterface fun setNotifications(enable: Boolean) = post { host.setNotifications(enable) }
-    @JavascriptInterface fun logout() = post { host.logout() }
 
     private fun post(action: () -> Unit) {
         main.post(action)
