@@ -40,6 +40,7 @@ object ShellStatus {
 data class NotificationItem(
     val sessionId: String,
     val messageId: String,
+    val seq: Long,
     val title: String,
     val preview: String,
     val recordedAt: Long,
@@ -50,7 +51,9 @@ data class NotificationItem(
             val messageId = json.getString("message_id")
             require(sessionId.isNotEmpty() && messageId.isNotEmpty()) { "通知消息身份不能为空" }
             val recordedAt = OffsetDateTime.parse(json.getString("recorded_at")).toInstant().toEpochMilli()
-            return NotificationItem(sessionId, messageId, json.getString("title"), json.getString("preview"), recordedAt)
+            return NotificationItem(
+                sessionId, messageId, json.getLong("seq"), json.getString("title"), json.getString("preview"), recordedAt,
+            )
         }
     }
 }
@@ -63,6 +66,8 @@ object Notifications {
     const val CHANNEL_MESSAGES = "messages"
     private const val CHANNEL_CONNECTION = "connection"
     private const val GROUP = "akashic.messages"
+    private const val MESSAGE_ID = 2
+    private const val EXTRA_SEQ = "seq"
     private val ACCENT = Color.rgb(0x1B, 0x36, 0x5D)
 
     fun ensureChannels(context: Context) {
@@ -111,11 +116,21 @@ object Notifications {
             .setCategory(Notification.CATEGORY_MESSAGE)
             .setGroup(GROUP)
             .setAutoCancel(true)
-            .addExtras(android.os.Bundle().apply { putString("message_id", item.messageId) })
+            .addExtras(android.os.Bundle().apply {
+                putString("message_id", item.messageId)
+                putLong(EXTRA_SEQ, item.seq)
+            })
             .setContentIntent(pending)
             .build()
-        manager.notify(item.sessionId, 2, notification)
+        manager.notify(item.sessionId, MESSAGE_ID, notification)
         return true
+    }
+
+    // 会话已在任一设备读到 seq：撤掉不晚于该位置的提醒；升级前发出的提醒没有 seq，一并撤掉。
+    fun clearRead(context: Context, sessionId: String, seq: Long) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val active = manager.activeNotifications.firstOrNull { it.tag == sessionId && it.id == MESSAGE_ID } ?: return
+        if (active.notification.extras.getLong(EXTRA_SEQ, -1) <= seq) manager.cancel(sessionId, MESSAGE_ID)
     }
 
     fun ongoing(context: Context, state: ConnectionState): Notification {

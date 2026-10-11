@@ -27,6 +27,8 @@ class NotifyService : Service() {
     @Volatile private var running = false
     @Volatile private var connection: HttpURLConnection? = null
     @Volatile private var worker: Thread? = null
+    // 旧服务端拒绝未知请求字段；收到 422 后退回不请求已读事件。
+    @Volatile private var readEvents = true
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private lateinit var prefs: ShellPrefs
 
@@ -109,15 +111,22 @@ class NotifyService : Service() {
         current.setRequestProperty("Accept", "text/event-stream")
         connection = current
         return try {
-            val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL).toString()
-            current.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
+            if (readEvents) body.put("read_events", true)
+            current.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             when (current.responseCode) {
                 200 -> {
                     check(current.contentType?.startsWith("text/event-stream") == true) { "通知接口未返回 SSE" }
                     readEvents(current, server)
                 }
                 404, 405 -> StreamOutcome.Unsupported
-                400, 401, 403, 422 -> error("通知接口拒绝请求：${current.responseCode}")
+                422 -> if (readEvents) {
+                    readEvents = false
+                    StreamOutcome.Dropped(established = true)
+                } else {
+                    error("通知接口拒绝请求：422")
+                }
+                400, 401, 403 -> error("通知接口拒绝请求：${current.responseCode}")
                 else -> StreamOutcome.Dropped(established = false)
             }
         } catch (_: IOException) {
@@ -160,6 +169,10 @@ class NotifyService : Service() {
         when (event) {
             "ready" -> {
                 prefs.saveCursor(server, json.getJSONObject("cursor"))
+                // 离线期间在别处读过的会话，重连后撤掉对应提醒。
+                json.optJSONObject("read")?.let { read ->
+                    read.keys().forEach { sessionId -> Notifications.clearRead(this, sessionId, read.getLong(sessionId)) }
+                }
                 setState(ConnectionState.LISTENING)
             }
             "message" -> {
@@ -177,6 +190,7 @@ class NotifyService : Service() {
                 }
             }
             "cursor" -> prefs.advanceCursor(server, json.getString("session_id"), json.getLong("seq"))
+            "read" -> Notifications.clearRead(this, json.getString("session_id"), json.getLong("seq"))
             "heartbeat" -> Unit
             else -> error("未知通知事件：$event")
         }
