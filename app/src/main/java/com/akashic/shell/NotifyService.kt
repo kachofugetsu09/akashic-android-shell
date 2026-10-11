@@ -27,8 +27,6 @@ class NotifyService : Service() {
     @Volatile private var running = false
     @Volatile private var connection: HttpURLConnection? = null
     @Volatile private var worker: Thread? = null
-    // 旧服务端拒绝未知请求字段；收到 422 后退回不请求已读事件。
-    @Volatile private var readEvents = true
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private lateinit var prefs: ShellPrefs
 
@@ -99,41 +97,43 @@ class NotifyService : Service() {
         }
     }
 
+    // 每次重连重新探测；旧服务端的 422 只降级当前连接，不跨服务器保留。
     private fun streamOnce(server: String): StreamOutcome {
-        val current = try {
-            Server.open("$server/api/chat/notifications/stream", readTimeoutMs = READ_TIMEOUT_MS)
-        } catch (_: IOException) {
-            return StreamOutcome.Dropped(established = false)
-        }
-        current.requestMethod = "POST"
-        current.doOutput = true
-        current.setRequestProperty("Content-Type", "application/json")
-        current.setRequestProperty("Accept", "text/event-stream")
-        connection = current
-        return try {
-            val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
-            if (readEvents) body.put("read_events", true)
-            current.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-            when (current.responseCode) {
-                200 -> {
-                    check(current.contentType?.startsWith("text/event-stream") == true) { "通知接口未返回 SSE" }
-                    readEvents(current, server)
-                }
-                404, 405 -> StreamOutcome.Unsupported
-                422 -> if (readEvents) {
-                    readEvents = false
-                    StreamOutcome.Dropped(established = true)
-                } else {
-                    error("通知接口拒绝请求：422")
-                }
-                400, 401, 403 -> error("通知接口拒绝请求：${current.responseCode}")
-                else -> StreamOutcome.Dropped(established = false)
+        var requestReadEvents = true
+        while (true) {
+            val current = try {
+                Server.open("$server/api/chat/notifications/stream", readTimeoutMs = READ_TIMEOUT_MS)
+            } catch (_: IOException) {
+                return StreamOutcome.Dropped(established = false)
             }
-        } catch (_: IOException) {
-            StreamOutcome.Dropped(established = false)
-        } finally {
-            connection = null
-            current.disconnect()
+            current.requestMethod = "POST"
+            current.doOutput = true
+            current.setRequestProperty("Content-Type", "application/json")
+            current.setRequestProperty("Accept", "text/event-stream")
+            connection = current
+            try {
+                val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
+                if (requestReadEvents) body.put("read_events", true)
+                current.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                when (current.responseCode) {
+                    200 -> {
+                        check(current.contentType?.startsWith("text/event-stream") == true) { "通知接口未返回 SSE" }
+                        return readEvents(current, server)
+                    }
+                    404, 405 -> return StreamOutcome.Unsupported
+                    422 -> {
+                        check(requestReadEvents) { "通知接口拒绝请求：422" }
+                        requestReadEvents = false
+                    }
+                    400, 401, 403 -> error("通知接口拒绝请求：${current.responseCode}")
+                    else -> return StreamOutcome.Dropped(established = false)
+                }
+            } catch (_: IOException) {
+                return StreamOutcome.Dropped(established = false)
+            } finally {
+                connection = null
+                current.disconnect()
+            }
         }
     }
 
