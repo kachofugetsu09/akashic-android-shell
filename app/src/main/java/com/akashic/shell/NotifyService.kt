@@ -97,34 +97,43 @@ class NotifyService : Service() {
         }
     }
 
+    // 每次重连重新探测；旧服务端的 422 只降级当前连接，不跨服务器保留。
     private fun streamOnce(server: String): StreamOutcome {
-        val current = try {
-            Server.open("$server/api/chat/notifications/stream", readTimeoutMs = READ_TIMEOUT_MS)
-        } catch (_: IOException) {
-            return StreamOutcome.Dropped(established = false)
-        }
-        current.requestMethod = "POST"
-        current.doOutput = true
-        current.setRequestProperty("Content-Type", "application/json")
-        current.setRequestProperty("Accept", "text/event-stream")
-        connection = current
-        return try {
-            val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL).toString()
-            current.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            when (current.responseCode) {
-                200 -> {
-                    check(current.contentType?.startsWith("text/event-stream") == true) { "通知接口未返回 SSE" }
-                    readEvents(current, server)
-                }
-                404, 405 -> StreamOutcome.Unsupported
-                400, 401, 403, 422 -> error("通知接口拒绝请求：${current.responseCode}")
-                else -> StreamOutcome.Dropped(established = false)
+        var requestReadEvents = true
+        while (true) {
+            val current = try {
+                Server.open("$server/api/chat/notifications/stream", readTimeoutMs = READ_TIMEOUT_MS)
+            } catch (_: IOException) {
+                return StreamOutcome.Dropped(established = false)
             }
-        } catch (_: IOException) {
-            StreamOutcome.Dropped(established = false)
-        } finally {
-            connection = null
-            current.disconnect()
+            current.requestMethod = "POST"
+            current.doOutput = true
+            current.setRequestProperty("Content-Type", "application/json")
+            current.setRequestProperty("Accept", "text/event-stream")
+            connection = current
+            try {
+                val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
+                if (requestReadEvents) body.put("read_events", true)
+                current.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                when (current.responseCode) {
+                    200 -> {
+                        check(current.contentType?.startsWith("text/event-stream") == true) { "通知接口未返回 SSE" }
+                        return readEvents(current, server)
+                    }
+                    404, 405 -> return StreamOutcome.Unsupported
+                    422 -> {
+                        check(requestReadEvents) { "通知接口拒绝请求：422" }
+                        requestReadEvents = false
+                    }
+                    400, 401, 403 -> error("通知接口拒绝请求：${current.responseCode}")
+                    else -> return StreamOutcome.Dropped(established = false)
+                }
+            } catch (_: IOException) {
+                return StreamOutcome.Dropped(established = false)
+            } finally {
+                connection = null
+                current.disconnect()
+            }
         }
     }
 
@@ -160,6 +169,10 @@ class NotifyService : Service() {
         when (event) {
             "ready" -> {
                 prefs.saveCursor(server, json.getJSONObject("cursor"))
+                // 离线期间在别处读过的会话，重连后撤掉对应提醒。
+                json.optJSONObject("read")?.let { read ->
+                    read.keys().forEach { sessionId -> Notifications.clearRead(this, sessionId, read.getLong(sessionId)) }
+                }
                 setState(ConnectionState.LISTENING)
             }
             "message" -> {
@@ -177,6 +190,7 @@ class NotifyService : Service() {
                 }
             }
             "cursor" -> prefs.advanceCursor(server, json.getString("session_id"), json.getLong("seq"))
+            "read" -> Notifications.clearRead(this, json.getString("session_id"), json.getLong("seq"))
             "heartbeat" -> Unit
             else -> error("未知通知事件：$event")
         }
