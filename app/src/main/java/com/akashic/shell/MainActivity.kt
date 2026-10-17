@@ -353,6 +353,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         if (!Server.sameOrigin(server, url)) return
         remoteLoaded = true
         offlineReason = ""
+        // 登录页不算就绪；回到服务器其他页面说明已登录，唤醒等待登录的通知连接。
+        if (url.path?.startsWith("/_auth") != true) NotifyService.resumeAfterLogin(this)
         if (panelMode == PanelMode.OFFLINE) hidePanel()
         if (!prefs.onboardingDone && panelMode == null) showPanel(PanelMode.ONBOARDING) else syncBarsWithPage()
     }
