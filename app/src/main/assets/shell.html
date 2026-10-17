@@ -251,7 +251,7 @@
     if (!granted) { label = "没有通知权限"; dot += " bad"; }
     else if (!state.notificationsWanted) { label = "通知已关闭"; }
     else if (state.connection === "LISTENING") { dot += " live"; }
-    else if (state.connection === "FAILED" || state.connection === "UNSUPPORTED") { dot += " bad"; }
+    else if (state.connection === "FAILED" || state.connection === "UNSUPPORTED" || state.connection === "LOGIN_REQUIRED") { dot += " bad"; }
     else { dot += " busy"; }
     $("st-connection").innerHTML = "";
     var mark = document.createElement("span");

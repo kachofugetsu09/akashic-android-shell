@@ -14,11 +14,13 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import android.util.Log
+import android.webkit.CookieManager
 import java.time.format.DateTimeParseException
 
 private sealed interface StreamOutcome {
     data class Dropped(val established: Boolean) : StreamOutcome
     data object Unsupported : StreamOutcome
+    data object LoginRequired : StreamOutcome
 }
 
 // 前台服务只订阅服务端的通知流：收到提醒就弹系统通知，不同步任何聊天内容。
@@ -92,6 +94,8 @@ class NotifyService : Service() {
                     BACKOFF_MS[minOf(failures, BACKOFF_MS.size) - 1]
                 }
                 StreamOutcome.Unsupported -> { failures = 0; setState(ConnectionState.UNSUPPORTED); 300_000L }
+                // 登录失效不是数据错误：等用户在页面里重新登录后由 reconnect 唤醒，期间低频重试。
+                StreamOutcome.LoginRequired -> { failures = 0; setState(ConnectionState.LOGIN_REQUIRED); 300_000L }
             }
             pause(waitMs)
         }
@@ -110,6 +114,8 @@ class NotifyService : Service() {
             current.doOutput = true
             current.setRequestProperty("Content-Type", "application/json")
             current.setRequestProperty("Accept", "text/event-stream")
+            // 服务端开启登录后，通知流与页面共用 WebView 里的登录 Cookie。
+            CookieManager.getInstance().getCookie(server)?.let { current.setRequestProperty("Cookie", it) }
             connection = current
             try {
                 val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
@@ -125,7 +131,8 @@ class NotifyService : Service() {
                         check(requestReadEvents) { "通知接口拒绝请求：422" }
                         requestReadEvents = false
                     }
-                    400, 401, 403 -> error("通知接口拒绝请求：${current.responseCode}")
+                    401, 403 -> return StreamOutcome.LoginRequired
+                    400 -> error("通知接口拒绝请求：400")
                     else -> return StreamOutcome.Dropped(established = false)
                 }
             } catch (_: IOException) {
@@ -249,6 +256,11 @@ class NotifyService : Service() {
             } else {
                 context.stopService(Intent(context, NotifyService::class.java))
             }
+        }
+
+        // 页面登录成功后调用：只唤醒正在等待登录的连接，不打断正常接收。
+        fun resumeAfterLogin(context: Context) {
+            if (ShellStatus.connection == ConnectionState.LOGIN_REQUIRED) reconnect(context)
         }
 
         fun reconnect(context: Context) {
