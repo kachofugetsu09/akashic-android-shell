@@ -5,7 +5,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -30,7 +33,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 
-// 端侧后台控制桥：向 Akashic 服务端维持 /api/phone/stream 长连接，管理 VirtualDisplay / 无障碍操作与右下角画中画小窗。
+// 端侧后台控制桥：向 Akashic 服务端维持 /api/phone/stream 长连接，管理 UID 2000 特权 VirtualDisplay 与右下角画中画小窗。
 object PhoneBridgeController {
     private const val TAG = "AkashicPhoneBridge"
     private const val READ_TIMEOUT_MS = 45_000
@@ -48,7 +51,11 @@ object PhoneBridgeController {
         private set
     @Volatile var virtualDisplayId: Int? = null
         private set
+    @Volatile var isTrustedVirtualDisplay: Boolean = false
+        private set
     @Volatile var latestPreviewPng: ByteArray? = null
+        private set
+    @Volatile var latestFullPng: ByteArray? = null
         private set
 
     var pipListener: ((PipMode, String, ByteArray?) -> Unit)? = null
@@ -56,19 +63,21 @@ object PhoneBridgeController {
     private var worker: Thread? = null
     @Volatile private var running = false
     @Volatile private var activeConnection: HttpURLConnection? = null
-    private val wake = Object()
+    private val wake = Any()
 
     private var displayThread: HandlerThread? = null
     private var displayHandler: Handler? = null
     private var imageReader: ImageReader? = null
-    private var virtualDisplay: VirtualDisplay? = null
+    private var localVirtualDisplay: VirtualDisplay? = null
     private val activePackages = LinkedHashSet<String>()
     private var lastNodeRefs: Map<Int, AccessibilityNodeInfo> = emptyMap()
+    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     fun sync(context: Context) {
         val prefs = ShellPrefs(context)
         val should = prefs.serverUrl != null && prefs.phoneUseEnabled
         if (should) {
+            ShellHelperHub.tryAutoStartIfPaired(context.applicationContext)
             start(context.applicationContext)
         } else {
             stop()
@@ -78,7 +87,7 @@ object PhoneBridgeController {
     @Synchronized
     fun start(appContext: Context) {
         if (running && worker?.isAlive == true) {
-            synchronized(wake) { wake.notifyAll() }
+            synchronized(wake) { (wake as Object).notifyAll() }
             return
         }
         running = true
@@ -92,7 +101,7 @@ object PhoneBridgeController {
     fun stop() {
         running = false
         activeConnection?.disconnect()
-        synchronized(wake) { wake.notifyAll() }
+        synchronized(wake) { (wake as Object).notifyAll() }
         releaseVirtualDisplay()
         connected = false
         updatePip(PipMode.HIDDEN, "已关闭", null)
@@ -110,6 +119,10 @@ object PhoneBridgeController {
     fun handleTakeoverTap(context: Context) {
         val pkg = takeoverPackage ?: activePackages.lastOrNull()
         if (pkg != null) {
+            val sh = ShellHelperHub.shell
+            if (sh != null) {
+                runCatching { sh.moveTaskToDisplay(pkg, Display.DEFAULT_DISPLAY) }
+            }
             val launch = context.packageManager.getLaunchIntentForPackage(pkg)
             if (launch != null) {
                 launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -127,7 +140,11 @@ object PhoneBridgeController {
     }
 
     private fun ensureVirtualDisplay(context: Context): Int {
-        virtualDisplayId?.let { return it }
+        virtualDisplayId?.let { currentId ->
+            if (isTrustedVirtualDisplay || ShellHelperHub.shell == null) return currentId
+            // 如果之前还没配对，现在刚刚配对上了 UID 2000 助手，释放旧屏重建 Trusted 虚拟屏
+            releaseVirtualDisplay()
+        }
         synchronized(this) {
             virtualDisplayId?.let { return it }
             val dm = context.getSystemService(DisplayManager::class.java)
@@ -141,21 +158,35 @@ object PhoneBridgeController {
             val ht = HandlerThread("akashic-vd").apply { start() }
             val hnd = Handler(ht.looper)
             val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            var lastFrameMs = 0L
             reader.setOnImageAvailableListener({ r ->
                 val img = runCatching { r.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
                 try {
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastFrameMs < 90L && latestPreviewPng != null) return@setOnImageAvailableListener
+                    lastFrameMs = now
                     val plane = img.planes[0]
                     val strideWidth = plane.rowStride / plane.pixelStride
-                    val bmp = Bitmap.createBitmap(strideWidth, h, Bitmap.Config.ARGB_8888)
-                    bmp.copyPixelsFromBuffer(plane.buffer.rewind())
-                    val cropped = if (strideWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
-                    if (cropped !== bmp) bmp.recycle()
-                    val scaled = Bitmap.createScaledBitmap(cropped, 360, (360f * h / w).toInt().coerceAtLeast(360), true)
-                    if (scaled !== cropped) cropped.recycle()
-                    val out = ByteArrayOutputStream()
-                    scaled.compress(Bitmap.CompressFormat.PNG, 85, out)
-                    scaled.recycle()
-                    latestPreviewPng = out.toByteArray()
+                    val rawBmp = Bitmap.createBitmap(strideWidth, h, Bitmap.Config.ARGB_8888)
+                    rawBmp.copyPixelsFromBuffer(plane.buffer.rewind())
+
+                    val fullBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    Canvas(fullBmp).drawBitmap(rawBmp, Rect(0, 0, w, h), Rect(0, 0, w, h), bitmapPaint)
+                    rawBmp.recycle()
+
+                    val fullOut = ByteArrayOutputStream()
+                    fullBmp.compress(Bitmap.CompressFormat.PNG, 90, fullOut)
+                    latestFullPng = fullOut.toByteArray()
+
+                    val prevW = 360
+                    val prevH = (360f * h / w).toInt().coerceAtLeast(360)
+                    val prevBmp = Bitmap.createScaledBitmap(fullBmp, prevW, prevH, true)
+                    fullBmp.recycle()
+                    val prevOut = ByteArrayOutputStream()
+                    prevBmp.compress(Bitmap.CompressFormat.PNG, 85, prevOut)
+                    prevBmp.recycle()
+                    latestPreviewPng = prevOut.toByteArray()
+
                     if (pipMode != PipMode.HIDDEN) {
                         pipListener?.invoke(pipMode, pipLabel, latestPreviewPng)
                     }
@@ -165,39 +196,43 @@ object PhoneBridgeController {
                 }
             }, hnd)
 
-            // 先尝试带 TRUSTED + OWN_FOCUS + STEAL_TOP_FOCUS_DISABLED 标志创建独立焦点虚拟屏，若无 shell 权限则自动回退到普通 VirtualDisplay
-            val baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-                (1 shl 6) or (1 shl 7) or (1 shl 8)
-            val trustedFlags = baseFlags or (1 shl 10) or (1 shl 11) or (1 shl 12) or (1 shl 13) or (1 shl 14) or (1 shl 16)
-            val vd = runCatching {
-                dm.createVirtualDisplay("akashic-agent", w, h, dpi, reader.surface, trustedFlags)
-            }.getOrElse {
-                runCatching {
-                    dm.createVirtualDisplay("akashic-agent", w, h, dpi, reader.surface, baseFlags)
-                }.getOrNull()
+            // 1. 优先通过已配对的 UID 2000 ShellService 创建带 TRUSTED + OWN_FOCUS + STEAL_TOP_FOCUS_DISABLED 的后台虚拟屏
+            val sh = ShellHelperHub.shell ?: run {
+                ShellHelperHub.tryAutoStartIfPaired(context)
+                SystemClock.sleep(500L)
+                ShellHelperHub.shell
             }
-            if (vd != null) {
-                displayThread = ht
-                displayHandler = hnd
-                imageReader = reader
-                virtualDisplay = vd
-                val id = vd.display.displayId
-                virtualDisplayId = id
-                return id
-            } else {
-                reader.close()
-                ht.quitSafely()
-                return Display.DEFAULT_DISPLAY
+            if (sh != null) {
+                val id = runCatching { sh.createDisplay(reader.surface, w, h, dpi) }.getOrDefault(-1)
+                if (id > 0) {
+                    displayThread = ht
+                    displayHandler = hnd
+                    imageReader = reader
+                    virtualDisplayId = id
+                    isTrustedVirtualDisplay = true
+                    return id
+                }
             }
+
+            // 2. 未配对无线调试时，不建无效的空虚拟屏，直接使用主屏 ID (0) 并通过 AccessibilityService.takeScreenshot 实时抓图供小窗显示
+            reader.close()
+            ht.quitSafely()
+            virtualDisplayId = Display.DEFAULT_DISPLAY
+            isTrustedVirtualDisplay = false
+            return Display.DEFAULT_DISPLAY
         }
     }
 
     private fun releaseVirtualDisplay() {
         synchronized(this) {
-            virtualDisplay?.release()
-            virtualDisplay = null
+            val id = virtualDisplayId
+            if (isTrustedVirtualDisplay && id != null && id > 0) {
+                runCatching { ShellHelperHub.shell?.releaseDisplay(id) }
+            }
+            localVirtualDisplay?.release()
+            localVirtualDisplay = null
             virtualDisplayId = null
+            isTrustedVirtualDisplay = false
             imageReader?.close()
             imageReader = null
             displayThread?.quitSafely()
@@ -206,6 +241,7 @@ object PhoneBridgeController {
             activePackages.clear()
             takeoverReason = null
             takeoverPackage = null
+            latestFullPng = null
         }
     }
 
@@ -228,14 +264,19 @@ object PhoneBridgeController {
                 ms
             }
             synchronized(wake) {
-                if (running) wake.wait(waitMs)
+                if (running) (wake as Object).wait(waitMs)
             }
         }
     }
 
     private fun buildHello(context: Context): JSONObject {
+        val shReady = ShellHelperHub.shell != null
         val a11yReady = AkashicAccessibilityService.instance != null
-        val mode = if (a11yReady) "virtual_display" else "accessibility_only"
+        val mode = when {
+            shReady -> "virtual_display"
+            a11yReady -> "accessibility_only"
+            else -> "pairing_required"
+        }
         val pkgs = JSONArray()
         synchronized(this) { activePackages.forEach { pkgs.put(it) } }
         return JSONObject()
@@ -247,8 +288,8 @@ object PhoneBridgeController {
             .put("shell_version", BuildInfo.VERSION)
             .put("display_mode", mode)
             .put("virtual_display_id", virtualDisplayId ?: JSONObject.NULL)
-            .put("own_focus", Build.VERSION.SDK_INT >= 34)
-            .put("steal_top_focus_disabled", Build.VERSION.SDK_INT >= 34)
+            .put("own_focus", shReady && Build.VERSION.SDK_INT >= 34)
+            .put("steal_top_focus_disabled", shReady && Build.VERSION.SDK_INT >= 34)
             .put("pip_state", pipMode.id)
             .put("active_packages", pkgs)
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
@@ -355,7 +396,7 @@ object PhoneBridgeController {
                     val dispId = ensureVirtualDisplay(context)
                     val act = payload.optString("action")
                     val msg = runAction(context, dispId, act, payload)
-                    SystemClock.sleep(320L)
+                    SystemClock.sleep(420L)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     val screen = buildScreenObject(context, dispId, wantImg)
                     response.put("ok", true).put(
@@ -385,38 +426,44 @@ object PhoneBridgeController {
     }
 
     private fun runAction(context: Context, dispId: Int, action: String, payload: JSONObject): String {
+        val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
         return when (action) {
             "launch_app" -> {
                 val pkg = payload.optString("package_name")
-                val intent = context.packageManager.getLaunchIntentForPackage(pkg)
-                    ?: error("手机上未找到可启动的应用: $pkg")
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 synchronized(this) { activePackages.add(pkg) }
-                updatePip(PipMode.RUNNING, "正在打开 $pkg", null)
-                runCatching {
-                    val opts = android.app.ActivityOptions.makeBasic()
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && dispId != Display.DEFAULT_DISPLAY) {
-                        opts.launchDisplayId = dispId
-                    }
-                    context.startActivity(intent, opts.toBundle())
-                }.onFailure {
+                updatePip(PipMode.RUNNING, "后台运行 $pkg", null)
+                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    val code = sh.startApp(dispId, pkg)
+                    if (code == 2) error("手机上未找到可启动的应用: $pkg")
+                    if (code != 0) error("UID 2000 后台虚拟屏启动 $pkg 失败 (code=$code)")
+                    "已在后台独立虚拟屏 (#$dispId) 启动应用 $pkg（主屏幕不跳转）"
+                } else {
+                    val intent = context.packageManager.getLaunchIntentForPackage(pkg)
+                        ?: error("手机上未找到可启动的应用: $pkg")
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     context.startActivity(intent)
+                    "已启动应用 $pkg（提示：尚未完成无线调试配对，当前在前台启动；在 Akashic 设置中配对无线调试后即可在后台独立虚拟屏运行）"
                 }
-                "已在手机后台启动应用 $pkg"
             }
             "tap" -> {
                 val nodeId = payload.optInt("node_id", -1)
                 if (nodeId > 0) {
                     val node = lastNodeRefs[nodeId]
-                    if (node != null && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        updatePip(PipMode.RUNNING, "点击控件 #$nodeId", null)
-                        return "已点击控件 [$nodeId]"
-                    }
-                    if (node != null && a11y != null) {
-                        val r = android.graphics.Rect()
+                    if (node != null) {
+                        val r = Rect()
                         node.getBoundsInScreen(r)
-                        if (a11y.performTap(dispId, r.exactCenterX(), r.exactCenterY())) {
+                        if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                            if (sh.injectTap(dispId, r.centerX(), r.centerY())) {
+                                updatePip(PipMode.RUNNING, "点击控件 #$nodeId", null)
+                                return "已在后台虚拟屏点击控件 [$nodeId] (${r.centerX()}, ${r.centerY()})"
+                            }
+                        }
+                        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                            updatePip(PipMode.RUNNING, "点击控件 #$nodeId", null)
+                            return "已点击控件 [$nodeId]"
+                        }
+                        if (a11y != null && a11y.performTap(dispId, r.exactCenterX(), r.exactCenterY())) {
                             updatePip(PipMode.RUNNING, "点击坐标 #$nodeId", null)
                             return "已通过手势点击控件 [$nodeId]"
                         }
@@ -424,12 +471,17 @@ object PhoneBridgeController {
                 }
                 val x = payload.optInt("x", -1)
                 val y = payload.optInt("y", -1)
-                if (x >= 0 && y >= 0 && a11y != null && a11y.performTap(dispId, x.toFloat(), y.toFloat())) {
-                    updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
-                    "已点击坐标 ($x, $y)"
-                } else {
-                    error("无障碍服务未就绪或点击目标不可达，请确认已在系统设置开启 Akashic 无障碍服务")
+                if (x >= 0 && y >= 0) {
+                    if (sh != null && isTrustedVirtualDisplay && dispId > 0 && sh.injectTap(dispId, x, y)) {
+                        updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
+                        return "已在后台虚拟屏点击坐标 ($x, $y)"
+                    }
+                    if (a11y != null && a11y.performTap(dispId, x.toFloat(), y.toFloat())) {
+                        updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
+                        return "已点击坐标 ($x, $y)"
+                    }
                 }
+                error("点击目标不可达，请确认已开启无障碍或无线调试配对")
             }
             "type_text" -> {
                 val text = payload.optString("text")
@@ -455,39 +507,53 @@ object PhoneBridgeController {
             }
             "scroll" -> {
                 val dir = payload.optString("direction", "down")
-                if (a11y == null) error("无障碍服务未开启")
                 val dm = context.resources.displayMetrics
-                val cx = dm.widthPixels / 2f
-                val h = dm.heightPixels.toFloat()
-                when (dir) {
-                    "down" -> a11y.performSwipe(dispId, cx, h * 0.75f, cx, h * 0.25f, 320L)
-                    "up" -> a11y.performSwipe(dispId, cx, h * 0.25f, cx, h * 0.75f, 320L)
-                    "left" -> a11y.performSwipe(dispId, dm.widthPixels * 0.8f, h / 2f, dm.widthPixels * 0.2f, h / 2f, 320L)
-                    "right" -> a11y.performSwipe(dispId, dm.widthPixels * 0.2f, h / 2f, dm.widthPixels * 0.8f, h / 2f, 320L)
+                val cx = dm.widthPixels / 2
+                val h = dm.heightPixels
+                val (x1, y1, x2, y2) = when (dir) {
+                    "down" -> listOf(cx, (h * 0.75f).toInt(), cx, (h * 0.25f).toInt())
+                    "up" -> listOf(cx, (h * 0.25f).toInt(), cx, (h * 0.75f).toInt())
+                    "left" -> listOf((dm.widthPixels * 0.8f).toInt(), h / 2, (dm.widthPixels * 0.2f).toInt(), h / 2)
+                    else -> listOf((dm.widthPixels * 0.2f).toInt(), h / 2, (dm.widthPixels * 0.8f).toInt(), h / 2)
+                }
+                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    sh.injectSwipe(dispId, x1, y1, x2, y2, 320)
+                } else {
+                    a11y?.performSwipe(dispId, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), 320L)
                 }
                 updatePip(PipMode.RUNNING, "滚动 ($dir)", null)
                 "已执行滚动 ($dir)"
             }
             "swipe" -> {
-                if (a11y == null) error("无障碍服务未开启")
-                val x1 = payload.optInt("x", 500).toFloat()
-                val y1 = payload.optInt("y", 1500).toFloat()
-                val x2 = payload.optInt("end_x", 500).toFloat()
-                val y2 = payload.optInt("end_y", 500).toFloat()
-                val dur = payload.optLong("duration_ms", 300L)
-                a11y.performSwipe(dispId, x1, y1, x2, y2, dur)
+                val x1 = payload.optInt("x", 500)
+                val y1 = payload.optInt("y", 1500)
+                val x2 = payload.optInt("end_x", 500)
+                val y2 = payload.optInt("end_y", 500)
+                val dur = payload.optInt("duration_ms", 300)
+                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    sh.injectSwipe(dispId, x1, y1, x2, y2, dur)
+                } else {
+                    a11y?.performSwipe(dispId, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur.toLong())
+                }
                 "已滑动 ($x1,$y1)->($x2,$y2)"
             }
             "back" -> {
-                a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    sh.injectKey(dispId, KeyEvent.KEYCODE_BACK)
+                } else {
+                    a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                }
                 "已执行返回键"
             }
             "press_key" -> {
                 val key = payload.optString("key_code")
-                if (key.equals("BACK", ignoreCase = true) || key == KeyEvent.KEYCODE_BACK.toString()) {
+                val code = if (key.equals("BACK", ignoreCase = true)) KeyEvent.KEYCODE_BACK
+                else if (key.equals("ENTER", ignoreCase = true)) KeyEvent.KEYCODE_ENTER
+                else key.toIntOrNull() ?: KeyEvent.KEYCODE_BACK
+                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    sh.injectKey(dispId, code)
+                } else if (code == KeyEvent.KEYCODE_BACK) {
                     a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
-                } else if (key.equals("HOME", ignoreCase = true)) {
-                    a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME)
                 }
                 "已发送按键 $key"
             }
@@ -519,9 +585,13 @@ object PhoneBridgeController {
                 "已挂起后台操作并通知用户点击右下角橙色呼吸小窗或通知接管 ($reason)"
             }
             "resume_from_user" -> {
+                val pkg = takeoverPackage ?: activePackages.lastOrNull()
+                if (pkg != null && sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                    runCatching { sh.moveTaskToDisplay(pkg, dispId) }
+                }
                 takeoverReason = null
                 updatePip(PipMode.RUNNING, "后台恢复运行", null)
-                "已从用户主屏收回控制权继续后台执行"
+                "已从用户主屏收回控制权继续后台虚拟屏执行"
             }
             "wait" -> {
                 SystemClock.sleep(payload.optLong("duration_ms", 1000L).coerceIn(100L, 10_000L))
@@ -547,28 +617,42 @@ object PhoneBridgeController {
     }
 
     private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): JSONObject {
+        val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
         val dm = context.resources.displayMetrics
         val readout = a11y?.dumpScreen(dispId)
         if (readout != null) {
             lastNodeRefs = readout.nodeRefs
         }
-        val pngBytes = if (includeScreenshot) {
-            latestPreviewPng ?: a11y?.captureScreenshotPng(dispId)
+        val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
+        val resolvedPkg = topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
+            ?: readout?.packageName
+            ?: activePackages.lastOrNull()
+            ?: "com.akashic.shell"
+        val resolvedAct = topComp?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }
+            ?: readout?.activityName
+            ?: "MainActivity"
+
+        // 实时捕获截图并同时刷新右下角画中画小窗（解决小窗黑屏与截图空白问题）
+        val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && latestFullPng != null) {
+            if (includeScreenshot) latestFullPng else null
         } else {
-            null
+            val a11yPng = a11y?.captureScreenshotPng(if (isTrustedVirtualDisplay && dispId > 0) dispId else Display.DEFAULT_DISPLAY)
+            if (a11yPng != null && a11yPng.isNotEmpty()) {
+                latestFullPng = a11yPng
+                latestPreviewPng = a11yPng
+                pipListener?.invoke(pipMode, pipLabel, a11yPng)
+            }
+            if (includeScreenshot) (a11yPng ?: latestFullPng) else null
         }
-        if (pngBytes != null) {
-            latestPreviewPng = pngBytes
-            pipListener?.invoke(pipMode, pipLabel, pngBytes)
-        }
+
         return JSONObject()
             .put("display_id", dispId)
             .put("width", dm.widthPixels.takeIf { it > 0 } ?: 1080)
             .put("height", dm.heightPixels.takeIf { it > 0 } ?: 2400)
             .put("rotation", 0)
-            .put("package_name", readout?.packageName ?: activePackages.lastOrNull() ?: "com.akashic.shell")
-            .put("activity_name", readout?.activityName ?: "MainActivity")
+            .put("package_name", resolvedPkg)
+            .put("activity_name", resolvedAct)
             .put("pip_state", pipMode.id)
             .put("audio_muted", true)
             .put("nodes", readout?.nodes ?: JSONArray())

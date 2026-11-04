@@ -53,6 +53,12 @@
                 android:resource="@xml/accessibility_service" />
         </service>
 
+        <provider
+            android:name=".HelperHandoffProvider"
+            android:authorities="${applicationId}.helper"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

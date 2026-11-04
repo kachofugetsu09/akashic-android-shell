@@ -201,6 +201,9 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         .put("phoneUseEnabled", prefs.phoneUseEnabled)
         .put("phoneConnected", PhoneBridgeController.connected)
         .put("accessibilityEnabled", AkashicAccessibilityService.instance != null)
+        .put("adbHelperActive", ShellHelperHub.shell != null)
+        .put("adbHelperStatus", ShellHelperHub.statusText)
+        .put("adbPairingBusy", ShellHelperHub.pairingInProgress)
         .put("deviceId", PhoneBridgeController.deviceId(this))
         .put("version", BuildInfo.VERSION)
         .toString()
@@ -360,6 +363,22 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     override fun openAccessibilitySettings() {
         if (!launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))) {
             launch(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    override fun openWirelessDebuggingSettings() {
+        if (!launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) {
+            launch(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    override fun pairWirelessDebugging(code: String, portText: String) {
+        val manualPort = portText.trim().toIntOrNull()
+        ShellHelperHub.pairAndStart(this, code, manualPort) { _, msg ->
+            runOnUiThread {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                refreshPanel()
+            }
         }
     }
 
