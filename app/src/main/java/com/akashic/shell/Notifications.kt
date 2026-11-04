@@ -36,6 +36,10 @@ object ShellStatus {
         connection = state
         main.post { listener?.invoke() }
     }
+
+    fun notifyChanged() {
+        main.post { listener?.invoke() }
+    }
 }
 
 data class NotificationItem(
@@ -127,6 +131,44 @@ object Notifications {
         return true
     }
 
+    const val PAIRING_ID = 4
+    const val ACTION_PAIR_FROM_NOTIFICATION = "com.akashic.shell.PAIR_FROM_NOTIFICATION"
+    const val KEY_PAIR_CODE = "pair_code"
+
+    fun showPairingPrompt(context: Context, status: String = "在开发者选项中打开「使用配对码配对设备」后，点下方直接输入 6 位配对码") {
+        if (!canPost(context)) return
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val replyIntent = Intent(context, BootReceiver::class.java).setAction(ACTION_PAIR_FROM_NOTIFICATION)
+        val replyFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val replyPending = PendingIntent.getBroadcast(context, 4, replyIntent, replyFlags)
+        val remoteInput = android.app.RemoteInput.Builder(KEY_PAIR_CODE)
+            .setLabel("输入 6 位无线调试配对码（或 配对码:端口）")
+            .build()
+        val action = Notification.Action.Builder(null, "输入配对码", replyPending)
+            .addRemoteInput(remoteInput)
+            .build()
+        val notification = Notification.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(ACCENT)
+            .setContentTitle("Akashic 无线调试配对")
+            .setContentText(status)
+            .setStyle(Notification.BigTextStyle().bigText(status))
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setOngoing(false)
+            .setAutoCancel(true)
+            .addAction(action)
+            .build()
+        manager.notify("adb-pairing", PAIRING_ID, notification)
+    }
+
+    fun cancelPairingPrompt(context: Context) {
+        context.getSystemService(NotificationManager::class.java).cancel("adb-pairing", PAIRING_ID)
+    }
+
     // 会话已在任一设备读到 seq：撤掉不晚于该位置的提醒；升级前发出的提醒没有 seq，一并撤掉。
     fun clearRead(context: Context, sessionId: String, seq: Long) {
         val manager = context.getSystemService(NotificationManager::class.java)
@@ -156,5 +198,24 @@ object Notifications {
                 }
             }
             .build()
+    }
+
+    fun showTakeover(context: Context, reason: String) {
+        if (!canPost(context)) return
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val open = PendingIntent.getActivity(
+            context, 2, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = Notification.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(ACCENT)
+            .setContentTitle("Akashic 需要您接管手机屏幕")
+            .setContentText(reason)
+            .setStyle(Notification.BigTextStyle().bigText(reason))
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        manager.notify("phone-takeover", 3, notification)
     }
 }

@@ -251,6 +251,7 @@ class NotifyService : Service() {
         }
 
         fun sync(context: Context) {
+            PhoneBridgeController.sync(context)
             if (shouldRun(context)) {
                 context.startForegroundService(Intent(context, NotifyService::class.java))
             } else {
@@ -260,10 +261,12 @@ class NotifyService : Service() {
 
         // 页面登录成功后调用：只唤醒正在等待登录的连接，不打断正常接收。
         fun resumeAfterLogin(context: Context) {
+            PhoneBridgeController.sync(context)
             if (ShellStatus.connection == ConnectionState.LOGIN_REQUIRED) reconnect(context)
         }
 
         fun reconnect(context: Context) {
+            PhoneBridgeController.sync(context)
             if (!shouldRun(context)) return
             context.startForegroundService(Intent(context, NotifyService::class.java).setAction(ACTION_RECONNECT))
         }

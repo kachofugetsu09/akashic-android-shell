@@ -37,6 +37,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     private lateinit var prefs: ShellPrefs
     private lateinit var root: FrameLayout
     private lateinit var panel: WebView
+    private lateinit var pipView: AgentPipView
     private var remote: WebView? = null
     @Volatile private var panelMode: PanelMode? = null
     @Volatile private var offlineReason = ""
@@ -78,6 +79,10 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     override fun onResume() {
         super.onResume()
         ShellStatus.listener = ::refreshPanel
+        PhoneBridgeController.pipListener = { mode, label, png ->
+            pipView.updateState(mode, label, png)
+        }
+        pipView.updateState(PhoneBridgeController.pipMode, PhoneBridgeController.pipLabel, PhoneBridgeController.latestPreviewPng)
         NotifyService.sync(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()
@@ -85,6 +90,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun onPause() {
         ShellStatus.listener = null
+        PhoneBridgeController.pipListener = null
         CookieManager.getInstance().flush()
         super.onPause()
     }
@@ -116,6 +122,8 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         panel = createPanelWebView()
         panel.visibility = View.GONE
+        pipView = AgentPipView(this) { PhoneBridgeController.handleTakeoverTap(this) }
+        root.addView(pipView, pipView.defaultLayoutParams())
         root.addView(panel, fill())
         setContentView(root)
         applyBars(getColor(R.color.paper))
@@ -190,6 +198,13 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         .put("batteryUnrestricted", getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName))
         .put("connection", ShellStatus.connection.name)
         .put("connectionLabel", ShellStatus.connection.label)
+        .put("phoneUseEnabled", prefs.phoneUseEnabled)
+        .put("phoneConnected", PhoneBridgeController.connected)
+        .put("accessibilityEnabled", AkashicAccessibilityService.instance != null)
+        .put("adbHelperActive", ShellHelperHub.shell != null)
+        .put("adbHelperStatus", ShellHelperHub.statusText)
+        .put("adbPairingBusy", ShellHelperHub.pairingInProgress)
+        .put("deviceId", PhoneBridgeController.deviceId(this))
         .put("version", BuildInfo.VERSION)
         .toString()
 
@@ -337,6 +352,35 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         prefs.setNotificationsWanted(enable)
         NotifyService.sync(this)
         refreshPanel()
+    }
+
+    override fun setPhoneUse(enable: Boolean) {
+        prefs.setPhoneUseEnabled(enable)
+        PhoneBridgeController.sync(this)
+        refreshPanel()
+    }
+
+    override fun openAccessibilitySettings() {
+        if (!launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))) {
+            launch(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    override fun openWirelessDebuggingSettings() {
+        Notifications.showPairingPrompt(this)
+        if (!launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) {
+            launch(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    override fun pairWirelessDebugging(code: String, portText: String) {
+        val manualPort = portText.trim().toIntOrNull()
+        ShellHelperHub.pairAndStart(this, code, manualPort) { _, msg ->
+            runOnUiThread {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                refreshPanel()
+            }
+        }
     }
 
     private fun launch(intent: Intent): Boolean = try {

@@ -174,6 +174,33 @@
       </div>
     </div>
 
+    <h2>端侧手机控制 (Phone Use)</h2>
+    <div class="card">
+      <div class="row">
+        <div class="text">
+          <div class="title">允许 Akashic 后台操作手机</div>
+          <div class="sub" id="st-phone-status"><span class="dot"></span>未连接</div>
+        </div>
+        <label class="switch"><input id="st-phone-toggle" type="checkbox" aria-label="允许 Akashic 后台操作手机"><span></span></label>
+      </div>
+      <div class="row">
+        <div class="text"><div class="title">无障碍读屏与手势辅助</div><div class="sub" id="st-a11y-sub">-</div></div>
+        <button class="small" id="st-a11y" type="button">去开启</button>
+      </div>
+      <div class="row">
+        <div class="text">
+          <div class="title">后台独立虚拟屏（无线调试配对）</div>
+          <div class="sub" id="st-adb-sub">点「无线调试」并打开配对码弹窗后，直接下拉通知栏输入 6 位配对码（请勿切回本页以免弹窗关闭）</div>
+        </div>
+        <button class="small" id="st-adb-open" type="button">无线调试</button>
+      </div>
+      <div class="row" id="st-adb-pair-row">
+        <input id="st-adb-code" type="text" inputmode="numeric" maxlength="6" placeholder="6位配对码" style="margin:0;flex:1;padding:10px 12px;font-size:15px">
+        <input id="st-adb-port" type="text" inputmode="numeric" maxlength="5" placeholder="端口(可选)" style="margin:0;width:96px;padding:10px 12px;font-size:15px">
+        <button class="small" id="st-adb-pair" type="button">配对</button>
+      </div>
+    </div>
+
     <p class="foot">Akashic 外壳 <span id="st-version"></span> · 聊天内容只保存在服务器上<br>长按桌面图标也可以打开这里</p>
   </section>
 
@@ -262,6 +289,27 @@
     $("st-perm").textContent = perm[1] || "管理";
     $("st-battery-sub").textContent = state.batteryUnrestricted ? "不受限制，后台连接更稳定" : "受电池优化限制，后台可能断开";
     $("st-battery").textContent = state.batteryUnrestricted ? "管理" : "允许";
+    $("st-phone-toggle").checked = !!state.phoneUseEnabled;
+    var phoneDot = "dot";
+    var phoneLabel = "已关闭";
+    if (state.phoneUseEnabled) {
+      if (state.phoneConnected) {
+        phoneDot += " live";
+        phoneLabel = "已连接 (" + (state.deviceId || "android") + ") · 支持后台虚拟屏与右下角小窗";
+      } else {
+        phoneDot += " busy";
+        phoneLabel = "正在连接 /api/phone/stream…";
+      }
+    }
+    $("st-phone-status").innerHTML = "";
+    var pMark = document.createElement("span");
+    pMark.className = phoneDot;
+    $("st-phone-status").append(pMark, document.createTextNode(phoneLabel));
+    $("st-a11y-sub").textContent = state.accessibilityEnabled ? "已开启，可读屏控件树与自动点击输入" : "未开启，开启后可精确读取屏幕节点与手势点击";
+    $("st-a11y").textContent = state.accessibilityEnabled ? "管理" : "去开启";
+    $("st-adb-sub").textContent = state.adbHelperStatus || (state.adbHelperActive ? "已激活 UID 2000 后台独立虚拟屏" : "未配对（当前为普通无障碍模式）");
+    $("st-adb-pair").disabled = !!state.adbPairingBusy;
+    $("st-adb-pair").textContent = state.adbPairingBusy ? "配对中…" : (state.adbHelperActive ? "已激活" : "配对");
     $("st-version").textContent = state.version || "";
   }
 
@@ -345,6 +393,12 @@
     else shell.openNotificationSettings();
   });
   $("st-battery").addEventListener("click", function () { shell.requestBatteryExemption(); });
+  $("st-phone-toggle").addEventListener("change", function (event) { shell.setPhoneUse(event.target.checked); });
+  $("st-a11y").addEventListener("click", function () { shell.openAccessibilitySettings(); });
+  $("st-adb-open").addEventListener("click", function () { shell.openWirelessDebuggingSettings(); });
+  $("st-adb-pair").addEventListener("click", function () {
+    shell.pairWirelessDebugging($("st-adb-code").value || "", $("st-adb-port").value || "");
+  });
   $("off-retry").addEventListener("click", function () { shell.retry(); });
   $("off-change").addEventListener("click", function () { $("address").value = ""; shell.changeServer(); });
   $("off-settings").addEventListener("click", function () { shell.openSettings(); });
