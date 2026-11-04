@@ -309,6 +309,8 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 }
 
 object HelperMain {
+    private const val TAG = "AkashicHelperMain"
+
     @JvmStatic
     fun main(args: Array<String>) {
         if (args.size < 2) exitProcess(2)
@@ -318,6 +320,7 @@ object HelperMain {
         val service = AkashicShellService(appUid)
         service.enableAppAccessibility(packageName)
         deliverBinder(packageName, appUid, service)
+        Log.i(TAG, "HelperMain entered Looper.loop() for $packageName ($appUid)")
         Looper.loop()
     }
 
@@ -327,14 +330,21 @@ object HelperMain {
         val userId = appUid / 100_000
         val am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null)!!
         val token = Binder()
-        val holder = runCatching {
+        val holder = try {
             am.javaClass.getMethod(
                 "getContentProviderExternal", String::class.java, Int::class.javaPrimitiveType,
                 IBinder::class.java, String::class.java,
             ).invoke(am, authority, userId, token, "AkashicHelper")
-        }.getOrNull() ?: exitProcess(1)
+        } catch (t: Throwable) {
+            Log.e(TAG, "getContentProviderExternal failed", t)
+            null
+        } ?: exitProcess(1)
         try {
-            val provider = holder.javaClass.getField("provider").get(holder)!!
+            val providerField = holder.javaClass.getDeclaredField("provider").apply { isAccessible = true }
+            val provider = providerField.get(holder) ?: run {
+                Log.e(TAG, "holder.provider is null")
+                exitProcess(1)
+            }
             val extras = Bundle().apply {
                 putBinder("binder", service)
                 putInt("uid", Process.myUid())
@@ -345,11 +355,18 @@ object HelperMain {
             }
             val caller = AttributionSource.Builder(Process.myUid()).setPackageName(ShellContext.SHELL_PACKAGE).build()
             val res = call.invoke(provider, caller, authority, "attach", null, extras) as? Bundle
-            val appToken = res?.getBinder("token") ?: exitProcess(0)
+            val appToken = res?.getBinder("token") ?: run {
+                Log.e(TAG, "provider.call returned null or missing token: $res")
+                exitProcess(0)
+            }
+            Log.i(TAG, "Successfully delivered IAkashicShell binder to $packageName")
             appToken.linkToDeath({
                 runCatching { service.releaseAll() }
                 exitProcess(0)
             }, 0)
+        } catch (t: Throwable) {
+            Log.e(TAG, "deliverBinder failed", t)
+            exitProcess(1)
         } finally {
             runCatching {
                 am.javaClass.getMethod(
@@ -364,7 +381,8 @@ class HelperHandoffProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
-        if (method != "attach" || Binder.getCallingUid() != 2000) return null
+        val callerUid = Binder.getCallingUid()
+        if (method != "attach" || (callerUid != 2000 && callerUid != 0)) return null
         val binder = extras?.getBinder("binder") ?: return null
         return ShellHelperHub.acceptBinder(binder)
     }
@@ -394,6 +412,7 @@ object ShellHelperHub {
                     shell = null
                     statusText = "助手已断开"
                     ShellStatus.notifyChanged()
+                    PhoneBridgeController.notifyStateChanged()
                 }
             }, 0)
         }
@@ -401,6 +420,7 @@ object ShellHelperHub {
         statusText = "已激活 UID 2000 后台独立虚拟屏"
         handoffLatch?.countDown()
         ShellStatus.notifyChanged()
+        PhoneBridgeController.notifyStateChanged()
         return Bundle().apply {
             putBoolean("accepted", true)
             putBinder("token", appToken)
@@ -408,7 +428,7 @@ object ShellHelperHub {
     }
 
     fun tryAutoStartIfPaired(context: Context) {
-        if (shell != null || !ShellPrefs(context).adbPaired) return
+        if (shell != null) return
         Thread({
             runCatching { launchHelperOverAdb(context) }
         }, "AkashicHelperAutoStart").start()
@@ -427,7 +447,7 @@ object ShellHelperHub {
             try {
                 val port = manualPort?.takeIf { it in 1..65535 }
                     ?: AdbWireless.findPorts(context, AdbWireless.SERVICE_PAIRING, 8_000L).firstOrNull()
-                    ?: error("未发现无线调试配对弹窗，请先在「开发者选项 → 无线调试」中点开「使用配对码配对设备」")
+                    ?: error("未发现无线调试配对弹窗（打开配对码窗口后请勿切回本应用，直接下拉通知栏输入配对码）")
                 statusText = "正在与端口 $port 配对…"
                 ShellStatus.notifyChanged()
                 AdbWireless.pair(context, port, code)
@@ -452,26 +472,35 @@ object ShellHelperHub {
         if (shell != null) return
         val prefs = ShellPrefs(context)
         val candidates = LinkedHashSet<Int>()
+        // 优先尝试 5555（adbd tcpip 5555 模式在切换移动数据流量时依然监听 127.0.0.1:5555）
+        candidates.add(5555)
         prefs.lastAdbConnectPort.takeIf { it > 0 }?.let { candidates.add(it) }
         runCatching {
             val prop = Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
                 .invoke(null, "service.adb.tls.port") as? String
             prop?.trim()?.toIntOrNull()?.takeIf { it > 0 }?.let { candidates.add(it) }
         }
-        candidates.addAll(AdbWireless.findPorts(context, AdbWireless.SERVICE_CONNECT, 3_500L))
-        if (candidates.isEmpty()) error("未找到无线调试连接端口，请确认「无线调试」开关已打开")
+        runCatching {
+            val tcpProp = Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+                .invoke(null, "service.adb.tcp.port") as? String
+            tcpProp?.trim()?.toIntOrNull()?.takeIf { it > 0 }?.let { candidates.add(it) }
+        }
+        if (prefs.adbPaired) {
+            candidates.addAll(AdbWireless.findPorts(context, AdbWireless.SERVICE_CONNECT, 3_500L))
+        }
 
         var lastErr: Throwable? = null
         for (port in candidates) {
             try {
-                AdbConnection.open(context, port).use { conn ->
-                    prefs.setLastAdbConnectPort(port)
+                AdbConnection.open(context, port, timeoutMs = if (port == 5555) 2_500 else 6_000).use { conn ->
+                    if (port != 5555) prefs.setLastAdbConnectPort(port)
+                    prefs.setAdbPaired(true)
                     val latch = CountDownLatch(1)
                     handoffLatch = latch
                     val apk = context.applicationInfo.sourceDir
                     val pkg = context.packageName
                     val uid = Process.myUid()
-                    val cmd = "(CLASSPATH='$apk' setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
+                    val cmd = "(setprop service.adb.tcp.port 5555 >/dev/null 2>&1 || true; CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)
                     }
@@ -481,6 +510,8 @@ object ShellHelperHub {
                 lastErr = t
             }
         }
-        throw lastErr ?: IllegalStateException("无法连接本机无线调试端口")
+        if (prefs.adbPaired) {
+            throw lastErr ?: IllegalStateException("无法连接本机无线调试端口")
+        }
     }
 }

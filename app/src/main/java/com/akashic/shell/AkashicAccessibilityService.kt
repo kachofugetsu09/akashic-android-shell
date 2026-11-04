@@ -70,7 +70,8 @@ class AkashicAccessibilityService : AccessibilityService() {
         val roots = ArrayList<AccessibilityNodeInfo>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val byDisplay = windowsOnAllDisplays
-            val list = byDisplay.get(targetDisplayId) ?: byDisplay.get(Display.DEFAULT_DISPLAY)
+            val list = byDisplay.get(targetDisplayId)
+                ?: if (targetDisplayId == Display.DEFAULT_DISPLAY) byDisplay.get(Display.DEFAULT_DISPLAY) else null
             if (list != null) {
                 for (win in list) {
                     if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
@@ -79,7 +80,7 @@ class AkashicAccessibilityService : AccessibilityService() {
                     ) {
                         win.root?.let { root ->
                             roots.add(root)
-                            if (win.isActive && root.packageName != null) {
+                            if (root.packageName != null && (win.isActive || win.isFocused || roots.size == 1)) {
                                 pkgName = root.packageName.toString()
                             }
                         }
@@ -87,7 +88,7 @@ class AkashicAccessibilityService : AccessibilityService() {
                 }
             }
         }
-        if (roots.isEmpty()) {
+        if (roots.isEmpty() && targetDisplayId == Display.DEFAULT_DISPLAY) {
             rootInActiveWindow?.let { root ->
                 roots.add(root)
                 if (root.packageName != null) pkgName = root.packageName.toString()

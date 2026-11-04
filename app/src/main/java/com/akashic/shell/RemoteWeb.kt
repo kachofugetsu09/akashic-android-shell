@@ -107,5 +107,5 @@ private fun download(context: Context, url: String, userAgent: String, dispositi
 }
 
 object BuildInfo {
-    const val VERSION = "0.3.1"
+    const val VERSION = "0.3.2"
 }

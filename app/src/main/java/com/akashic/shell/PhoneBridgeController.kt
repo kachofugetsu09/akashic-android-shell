@@ -60,6 +60,7 @@ object PhoneBridgeController {
 
     var pipListener: ((PipMode, String, ByteArray?) -> Unit)? = null
 
+    @Volatile private var latestAppContext: Context? = null
     private var worker: Thread? = null
     @Volatile private var running = false
     @Volatile private var activeConnection: HttpURLConnection? = null
@@ -74,6 +75,7 @@ object PhoneBridgeController {
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     fun sync(context: Context) {
+        latestAppContext = context.applicationContext
         val prefs = ShellPrefs(context)
         val should = prefs.serverUrl != null && prefs.phoneUseEnabled
         if (should) {
@@ -270,6 +272,16 @@ object PhoneBridgeController {
     }
 
     private fun buildHello(context: Context): JSONObject {
+        return currentStateJson(context)
+            .put("type", "hello")
+            .put("device_id", deviceId(context))
+            .put("device_name", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
+            .put("model", Build.MODEL ?: "Android")
+            .put("sdk_int", Build.VERSION.SDK_INT)
+            .put("shell_version", BuildInfo.VERSION)
+    }
+
+    private fun currentStateJson(context: Context): JSONObject {
         val shReady = ShellHelperHub.shell != null
         val a11yReady = AkashicAccessibilityService.instance != null
         val mode = when {
@@ -280,12 +292,6 @@ object PhoneBridgeController {
         val pkgs = JSONArray()
         synchronized(this) { activePackages.forEach { pkgs.put(it) } }
         return JSONObject()
-            .put("type", "hello")
-            .put("device_id", deviceId(context))
-            .put("device_name", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
-            .put("model", Build.MODEL ?: "Android")
-            .put("sdk_int", Build.VERSION.SDK_INT)
-            .put("shell_version", BuildInfo.VERSION)
             .put("display_mode", mode)
             .put("virtual_display_id", virtualDisplayId ?: JSONObject.NULL)
             .put("own_focus", shReady && Build.VERSION.SDK_INT >= 34)
@@ -293,6 +299,17 @@ object PhoneBridgeController {
             .put("pip_state", pipMode.id)
             .put("active_packages", pkgs)
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
+    }
+
+    fun notifyStateChanged() {
+        val ctx = latestAppContext ?: return
+        val server = ShellPrefs(ctx).serverUrl ?: return
+        Thread({
+            val frame = currentStateJson(ctx)
+                .put("type", "state")
+                .put("device_id", deviceId(ctx))
+            postReply(server, null, frame)
+        }, "AkashicPhoneStatePush").start()
     }
 
     private fun connectOnce(context: Context, server: String): Boolean {
@@ -351,23 +368,28 @@ object PhoneBridgeController {
         val requestId = json.optString("request_id")
         val op = json.optString("op")
         val payload = json.optJSONObject("payload") ?: JSONObject()
+        val cookie = runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
         Thread({
             val reply = executeRpc(context, requestId, op, payload)
-            postReply(server, reply)
+            postReply(server, cookie, reply)
         }, "AkashicPhoneRpc-$requestId").start()
     }
 
-    private fun postReply(server: String, body: JSONObject) {
+    private fun postReply(server: String, cookie: String?, body: JSONObject) {
         try {
             val conn = Server.open("$server/api/phone/reply", readTimeoutMs = 15_000)
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("Origin", server)
-            CookieManager.getInstance().getCookie(server)?.let { conn.setRequestProperty("Cookie", it) }
+            val resolvedCookie = cookie ?: runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
+            resolvedCookie?.let { conn.setRequestProperty("Cookie", it) }
             try {
                 conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-                conn.responseCode
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    Log.w(TAG, "postReply HTTP $code")
+                }
             } finally {
                 conn.disconnect()
             }
@@ -390,19 +412,24 @@ object PhoneBridgeController {
                     updatePip(if (takeoverReason != null) PipMode.NEEDS_YOU else PipMode.RUNNING, "正在观察屏幕", null)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     val screen = buildScreenObject(context, dispId, wantImg)
-                    response.put("ok", true).put("result", screen)
+                    response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
                     val dispId = ensureVirtualDisplay(context)
                     val act = payload.optString("action")
                     val msg = runAction(context, dispId, act, payload)
-                    SystemClock.sleep(420L)
+                    val settleMs = if (act == "launch_app") 1_100L else 480L
+                    SystemClock.sleep(settleMs)
                     val wantImg = payload.optBoolean("include_screenshot", false)
-                    val screen = buildScreenObject(context, dispId, wantImg)
+                    var screen = buildScreenObject(context, dispId, wantImg)
+                    if (act == "launch_app" && (screen.optJSONArray("nodes")?.length() ?: 0) == 0) {
+                        SystemClock.sleep(800L)
+                        screen = buildScreenObject(context, dispId, wantImg)
+                    }
                     response.put("ok", true).put(
                         "result",
                         JSONObject().put("message", msg).put("screen", screen),
-                    )
+                    ).put("state", currentStateJson(context))
                 }
                 "finish" -> {
                     releaseVirtualDisplay()
@@ -415,7 +442,7 @@ object PhoneBridgeController {
                         JSONObject()
                             .put("kept", payload.optJSONArray("keep") ?: JSONArray())
                             .put("closed", payload.optJSONArray("close") ?: JSONArray()),
-                    )
+                    ).put("state", currentStateJson(context))
                 }
                 else -> response.put("ok", false).put("error", "未知端侧操作: $op")
             }
@@ -634,17 +661,19 @@ object PhoneBridgeController {
             ?: "MainActivity"
 
         // 实时捕获截图并同时刷新右下角画中画小窗（解决小窗黑屏与截图空白问题）
-        val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && latestFullPng != null) {
-            if (includeScreenshot) latestFullPng else null
+        val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && dispId > 0) {
+            if (latestFullPng == null) SystemClock.sleep(280L)
+            latestFullPng ?: a11y?.captureScreenshotPng(dispId)
         } else {
-            val a11yPng = a11y?.captureScreenshotPng(if (isTrustedVirtualDisplay && dispId > 0) dispId else Display.DEFAULT_DISPLAY)
+            val a11yPng = a11y?.captureScreenshotPng(Display.DEFAULT_DISPLAY)
             if (a11yPng != null && a11yPng.isNotEmpty()) {
                 latestFullPng = a11yPng
                 latestPreviewPng = a11yPng
                 pipListener?.invoke(pipMode, pipLabel, a11yPng)
             }
-            if (includeScreenshot) (a11yPng ?: latestFullPng) else null
+            a11yPng ?: latestFullPng
         }
+        val returnedPng = if (includeScreenshot) pngBytes else null
 
         return JSONObject()
             .put("display_id", dispId)
@@ -658,8 +687,8 @@ object PhoneBridgeController {
             .put("nodes", readout?.nodes ?: JSONArray())
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
             .apply {
-                if (pngBytes != null && pngBytes.isNotEmpty()) {
-                    put("screenshot_b64", Base64.encodeToString(pngBytes, Base64.NO_WRAP))
+                if (returnedPng != null && returnedPng.isNotEmpty()) {
+                    put("screenshot_b64", Base64.encodeToString(returnedPng, Base64.NO_WRAP))
                 }
             }
     }

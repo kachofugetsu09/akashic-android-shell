@@ -367,6 +367,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     }
 
     override fun openWirelessDebuggingSettings() {
+        Notifications.showPairingPrompt(this)
         if (!launch(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) {
             launch(Intent(Settings.ACTION_SETTINGS))
         }
