@@ -13,6 +13,7 @@ class ShellPrefs(context: Context) {
     val onboardingDone: Boolean get() = prefs.getBoolean(KEY_ONBOARDING, false)
     val notificationsWanted: Boolean get() = prefs.getBoolean(KEY_WANTED, false)
     val notificationAsked: Boolean get() = prefs.getBoolean(KEY_ASKED, false)
+    val phoneUseEnabled: Boolean get() = prefs.getBoolean(KEY_PHONE_USE, true)
 
     // Activity 与 Service 共用同一个 SharedPreferences 锁，切换地址与保存进度不能交错。
     fun selectServer(url: String, autoConnect: Boolean) = synchronized(prefs) {
@@ -50,6 +51,10 @@ class ShellPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_ASKED, true).apply()
     }
 
+    fun setPhoneUseEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_PHONE_USE, enabled).apply()
+    }
+
     private companion object {
         const val KEY_AUTO_CONNECT = "auto_connect"
         const val KEY_SERVER = "server_url"
@@ -57,5 +62,6 @@ class ShellPrefs(context: Context) {
         const val KEY_ONBOARDING = "onboarding_done"
         const val KEY_WANTED = "notifications_wanted"
         const val KEY_ASKED = "notification_asked"
+        const val KEY_PHONE_USE = "phone_use_enabled"
     }
 }

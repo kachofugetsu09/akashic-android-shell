@@ -3,4 +3,5 @@
     <string name="app_name">Akashic</string>
     <string name="shortcut_settings">设置</string>
     <string name="shortcut_settings_long">Akashic 设置</string>
+    <string name="accessibility_service_desc">供 Akashic 远程读取屏幕控件结构与辅助执行后台虚拟屏点击输入，仅在您授权的会话中使用。</string>
 </resources>

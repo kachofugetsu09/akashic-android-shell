@@ -36,6 +36,10 @@ object ShellStatus {
         connection = state
         main.post { listener?.invoke() }
     }
+
+    fun notifyChanged() {
+        main.post { listener?.invoke() }
+    }
 }
 
 data class NotificationItem(
@@ -156,5 +160,24 @@ object Notifications {
                 }
             }
             .build()
+    }
+
+    fun showTakeover(context: Context, reason: String) {
+        if (!canPost(context)) return
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val open = PendingIntent.getActivity(
+            context, 2, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = Notification.Builder(context, CHANNEL_MESSAGES)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(ACCENT)
+            .setContentTitle("Akashic 需要您接管手机屏幕")
+            .setContentText(reason)
+            .setStyle(Notification.BigTextStyle().bigText(reason))
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        manager.notify("phone-takeover", 3, notification)
     }
 }
