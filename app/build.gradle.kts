@@ -7,12 +7,16 @@ android {
     namespace = "com.akashic.shell"
     compileSdk = 36
 
-    defaultConfig {
+        defaultConfig {
         applicationId = "com.akashic.shell"
         minSdk = 30
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.2.3"
+        versionCode = 8
+        versionName = "0.3.2"
+    }
+
+    buildFeatures {
+        aidl = true
     }
 
     buildTypes {
