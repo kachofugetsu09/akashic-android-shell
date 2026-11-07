@@ -5,8 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
+import android.graphics.Matrix
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -18,6 +17,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.PersistableBundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
@@ -36,7 +36,12 @@ import java.net.HttpURLConnection
 // 端侧后台控制桥：向 Akashic 服务端维持 /api/phone/stream 长连接，管理 UID 2000 特权 VirtualDisplay 与右下角画中画小窗。
 object PhoneBridgeController {
     private const val TAG = "AkashicPhoneBridge"
-    private const val READ_TIMEOUT_MS = 45_000
+    // 服务端每 10s 发心跳；25s 收不到就认定长连接已失效并重连。
+    private const val READ_TIMEOUT_MS = 25_000
+    private const val REPLY_READ_TIMEOUT_MS = 30_000
+    private const val REPLY_ATTEMPTS = 3
+    private const val RPC_WAKE_LOCK_MS = 120_000L
+    private const val PREVIEW_INTERVAL_MS = 500L
     private val BACKOFF_MS = longArrayOf(1_000, 2_000, 5_000, 10_000, 30_000)
 
     @Volatile var connected: Boolean = false
@@ -72,7 +77,16 @@ object PhoneBridgeController {
     private var localVirtualDisplay: VirtualDisplay? = null
     private val activePackages = LinkedHashSet<String>()
     private var lastNodeRefs: Map<Int, AccessibilityNodeInfo> = emptyMap()
-    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    // 虚拟屏最新一帧（行宽含 stride 填充）；截图按需编码，不在每帧上编码整屏 PNG。
+    private val frameLock = Any()
+    private var frameBitmap: Bitmap? = null
+    private var frameSize = 0 to 0
+    private var frameSeq = 0L
+    private var encodedSeq = -1L
+    private var encodedPng: ByteArray? = null
+    // 最近的端侧失败（回传失败等），随下一次 ack 报给服务端。
+    private val recentErrors = ArrayDeque<String>()
+    private val handledRequests = LinkedHashSet<String>()
 
     fun sync(context: Context) {
         latestAppContext = context.applicationContext
@@ -160,37 +174,29 @@ object PhoneBridgeController {
             val ht = HandlerThread("akashic-vd").apply { start() }
             val hnd = Handler(ht.looper)
             val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-            var lastFrameMs = 0L
+            var lastPreviewMs = 0L
             reader.setOnImageAvailableListener({ r ->
                 val img = runCatching { r.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
                 try {
-                    val now = SystemClock.uptimeMillis()
-                    if (now - lastFrameMs < 90L && latestPreviewPng != null) return@setOnImageAvailableListener
-                    lastFrameMs = now
                     val plane = img.planes[0]
                     val strideWidth = plane.rowStride / plane.pixelStride
-                    val rawBmp = Bitmap.createBitmap(strideWidth, h, Bitmap.Config.ARGB_8888)
-                    rawBmp.copyPixelsFromBuffer(plane.buffer.rewind())
-
-                    val fullBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    Canvas(fullBmp).drawBitmap(rawBmp, Rect(0, 0, w, h), Rect(0, 0, w, h), bitmapPaint)
-                    rawBmp.recycle()
-
-                    val fullOut = ByteArrayOutputStream()
-                    fullBmp.compress(Bitmap.CompressFormat.PNG, 90, fullOut)
-                    latestFullPng = fullOut.toByteArray()
-
-                    val prevW = 360
-                    val prevH = (360f * h / w).toInt().coerceAtLeast(360)
-                    val prevBmp = Bitmap.createScaledBitmap(fullBmp, prevW, prevH, true)
-                    fullBmp.recycle()
-                    val prevOut = ByteArrayOutputStream()
-                    prevBmp.compress(Bitmap.CompressFormat.PNG, 85, prevOut)
-                    prevBmp.recycle()
-                    latestPreviewPng = prevOut.toByteArray()
-
-                    if (pipMode != PipMode.HIDDEN) {
-                        pipListener?.invoke(pipMode, pipLabel, latestPreviewPng)
+                    synchronized(frameLock) {
+                        val buf = frameBitmap?.takeIf { it.width == strideWidth && it.height == h }
+                            ?: Bitmap.createBitmap(strideWidth, h, Bitmap.Config.ARGB_8888).also {
+                                frameBitmap?.recycle()
+                                frameBitmap = it
+                            }
+                        buf.copyPixelsFromBuffer(plane.buffer.rewind())
+                        frameSize = w to h
+                        frameSeq++
+                    }
+                    val now = SystemClock.uptimeMillis()
+                    if (now - lastPreviewMs >= PREVIEW_INTERVAL_MS || latestPreviewPng == null) {
+                        lastPreviewMs = now
+                        latestPreviewPng = encodePreview()
+                        if (pipMode != PipMode.HIDDEN) {
+                            pipListener?.invoke(pipMode, pipLabel, latestPreviewPng)
+                        }
                     }
                 } catch (_: Throwable) {
                 } finally {
@@ -255,6 +261,13 @@ object PhoneBridgeController {
             takeoverReason = null
             takeoverPackage = null
             latestFullPng = null
+            synchronized(frameLock) {
+                frameBitmap?.recycle()
+                frameBitmap = null
+                frameSeq = 0L
+                encodedSeq = -1L
+                encodedPng = null
+            }
         }
     }
 
@@ -290,6 +303,7 @@ object PhoneBridgeController {
             .put("model", Build.MODEL ?: "Android")
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("shell_version", BuildInfo.VERSION)
+            .put("supports_ack", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -379,34 +393,87 @@ object PhoneBridgeController {
         val requestId = json.optString("request_id")
         val op = json.optString("op")
         val payload = json.optJSONObject("payload") ?: JSONObject()
+        if (!markHandled(requestId)) return
         val cookie = runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
-        Thread({
-            val reply = executeRpc(context, requestId, op, payload)
-            postReply(server, cookie, reply)
-        }, "AkashicPhoneRpc-$requestId").start()
+        Thread({ runRpc(context, server, cookie, requestId, op, payload) }, "AkashicPhoneRpc-$requestId").start()
     }
 
-    private fun postReply(server: String, cookie: String?, body: JSONObject) {
+    // 熄屏时 CPU 随时可能挂起：从收到请求到结果送达全程持 partial wake lock。
+    private fun runRpc(context: Context, server: String, cookie: String?, requestId: String, op: String, payload: JSONObject) {
+        val lock = context.getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "akashic:phone-rpc")
+            .apply { setReferenceCounted(false); acquire(RPC_WAKE_LOCK_MS) }
         try {
-            val conn = Server.open("$server/api/phone/reply", readTimeoutMs = 15_000)
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.setRequestProperty("Origin", server)
-            val resolvedCookie = cookie ?: runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
-            resolvedCookie?.let { conn.setRequestProperty("Cookie", it) }
-            try {
-                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-                val code = conn.responseCode
-                if (code !in 200..299) {
-                    Log.w(TAG, "postReply HTTP $code")
-                }
-            } finally {
-                conn.disconnect()
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "postReply failed", t)
+            // 1. 先回 ack，服务端据此区分"请求没送到"和"执行或回传慢"
+            val ack = JSONObject()
+                .put("type", "ack")
+                .put("device_id", deviceId(context))
+                .put("request_id", requestId)
+                .put("recent_errors", drainRecentErrors())
+            postReply(server, cookie, ack, attempts = 1)
+            // 2. 执行并回传结果，失败重试
+            val started = SystemClock.uptimeMillis()
+            val reply = executeRpc(context, requestId, op, payload)
+            val bytes = reply.toString().toByteArray(Charsets.UTF_8)
+            Log.i(TAG, "rpc $requestId $op executed in ${SystemClock.uptimeMillis() - started}ms, reply ${bytes.size / 1024}KB")
+            postReply(server, cookie, reply, attempts = REPLY_ATTEMPTS)
+        } finally {
+            lock.release()
         }
+    }
+
+    // 同一请求只执行一次，避免服务端重发或重复事件导致点击两次。
+    private fun markHandled(requestId: String): Boolean = synchronized(handledRequests) {
+        if (!handledRequests.add(requestId)) return false
+        while (handledRequests.size > 64) handledRequests.remove(handledRequests.first())
+        true
+    }
+
+    private fun recordError(message: String) {
+        Log.w(TAG, message)
+        synchronized(recentErrors) {
+            recentErrors.addLast(message)
+            while (recentErrors.size > 10) recentErrors.removeFirst()
+        }
+    }
+
+    private fun drainRecentErrors(): JSONArray = synchronized(recentErrors) {
+        JSONArray(recentErrors.toList()).also { recentErrors.clear() }
+    }
+
+    private fun postReply(server: String, cookie: String?, body: JSONObject, attempts: Int = 1): Boolean {
+        val bytes = body.toString().toByteArray(Charsets.UTF_8)
+        val kind = "${body.optString("type")} ${body.optString("request_id")}".trim()
+        repeat(attempts) { attempt ->
+            val started = SystemClock.uptimeMillis()
+            try {
+                val conn = Server.open("$server/api/phone/reply", readTimeoutMs = REPLY_READ_TIMEOUT_MS)
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setFixedLengthStreamingMode(bytes.size)
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Origin", server)
+                val resolvedCookie = cookie ?: runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
+                resolvedCookie?.let { conn.setRequestProperty("Cookie", it) }
+                try {
+                    conn.outputStream.use { it.write(bytes) }
+                    val code = conn.responseCode
+                    val elapsed = SystemClock.uptimeMillis() - started
+                    if (code in 200..299) {
+                        if (elapsed > 3_000L) recordError("postReply $kind slow: ${bytes.size / 1024}KB in ${elapsed}ms")
+                        return true
+                    }
+                    recordError("postReply $kind HTTP $code after ${elapsed}ms (attempt ${attempt + 1})")
+                    if (code in 400..499) return false
+                } finally {
+                    conn.disconnect()
+                }
+            } catch (t: Throwable) {
+                val elapsed = SystemClock.uptimeMillis() - started
+                recordError("postReply $kind ${t.javaClass.simpleName}: ${t.message} after ${elapsed}ms, ${bytes.size / 1024}KB (attempt ${attempt + 1})")
+            }
+        }
+        return false
     }
 
     private fun executeRpc(context: Context, requestId: String, op: String, payload: JSONObject): JSONObject {
@@ -416,19 +483,30 @@ object PhoneBridgeController {
             .put("device_id", devId)
             .put("request_id", requestId)
 
+        val timing = JSONObject()
+        var mark = SystemClock.uptimeMillis()
+        fun lap(name: String) {
+            val now = SystemClock.uptimeMillis()
+            timing.put(name, now - mark)
+            mark = now
+        }
         try {
             when (op) {
                 "observe" -> {
                     val dispId = ensureAwakeDisplay(context)
+                    lap("awake")
                     updatePip(if (takeoverReason != null) PipMode.NEEDS_YOU else PipMode.RUNNING, "正在观察屏幕", null)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     val screen = buildScreenObject(context, dispId, wantImg)
+                    lap("screen")
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
                     val dispId = ensureAwakeDisplay(context)
+                    lap("awake")
                     val act = payload.optString("action")
                     val msg = runAction(context, dispId, act, payload)
+                    lap("action")
                     val settleMs = if (act == "launch_app") 1_100L else 480L
                     SystemClock.sleep(settleMs)
                     val wantImg = payload.optBoolean("include_screenshot", false)
@@ -437,6 +515,7 @@ object PhoneBridgeController {
                         SystemClock.sleep(800L)
                         screen = buildScreenObject(context, dispId, wantImg)
                     }
+                    lap("screen")
                     response.put("ok", true).put(
                         "result",
                         JSONObject().put("message", msg).put("screen", screen),
@@ -460,7 +539,10 @@ object PhoneBridgeController {
         } catch (t: Throwable) {
             response.put("ok", false).put("error", t.message ?: t.javaClass.simpleName)
         }
-        return response
+        val screen = response.optJSONObject("result")?.let { it.optJSONObject("screen") ?: it }
+        screen?.optJSONArray("nodes")?.let { timing.put("nodes", it.length()) }
+        screen?.optString("screenshot_b64")?.takeIf { it.isNotEmpty() }?.let { timing.put("png_kb", it.length * 3 / 4 / 1024) }
+        return response.put("timing", timing)
     }
 
     private fun runAction(context: Context, dispId: Int, action: String, payload: JSONObject): String {
@@ -654,6 +736,37 @@ object PhoneBridgeController {
         }
     }
 
+    private fun hasFrame(): Boolean = synchronized(frameLock) { frameBitmap != null } || latestFullPng != null
+
+    // 按需把最新一帧编码成整屏 PNG；同一帧只编码一次。
+    private fun encodeFullPng(): ByteArray? {
+        synchronized(frameLock) {
+            val src = frameBitmap ?: return latestFullPng
+            if (encodedSeq == frameSeq) return encodedPng
+            val (w, h) = frameSize
+            val full = Bitmap.createBitmap(src, 0, 0, w, h)
+            val out = ByteArrayOutputStream()
+            full.compress(Bitmap.CompressFormat.PNG, 90, out)
+            if (full !== src) full.recycle()
+            encodedSeq = frameSeq
+            encodedPng = out.toByteArray()
+            return encodedPng
+        }
+    }
+
+    private fun encodePreview(): ByteArray? {
+        val scaled = synchronized(frameLock) {
+            val src = frameBitmap ?: return null
+            val (w, h) = frameSize
+            val scale = 360f / w
+            Bitmap.createBitmap(src, 0, 0, w, h, Matrix().apply { setScale(scale, scale) }, true)
+        }
+        val out = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.PNG, 85, out)
+        scaled.recycle()
+        return out.toByteArray()
+    }
+
     private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): JSONObject {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
@@ -673,8 +786,8 @@ object PhoneBridgeController {
 
         // 实时捕获截图并同时刷新右下角画中画小窗（解决小窗黑屏与截图空白问题）
         val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && dispId > 0) {
-            if (latestFullPng == null) SystemClock.sleep(280L)
-            latestFullPng ?: a11y?.captureScreenshotPng(dispId)
+            if (!hasFrame()) SystemClock.sleep(280L)
+            if (includeScreenshot) encodeFullPng() ?: a11y?.captureScreenshotPng(dispId) else null
         } else {
             val a11yPng = a11y?.captureScreenshotPng(Display.DEFAULT_DISPLAY)
             if (a11yPng != null && a11yPng.isNotEmpty()) {
