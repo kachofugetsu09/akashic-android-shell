@@ -13,5 +13,6 @@ interface IAkashicShell {
     String topActivity(int displayId) = 8;
     int[] identity() = 9;
     void releaseAll() = 10;
+    boolean keepAwake(int displayId) = 11;
     void destroy() = 16777114;
 }

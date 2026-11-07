@@ -97,6 +97,16 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)!!
     }
     private val taskInfoClass: Class<*> by lazy { Class.forName("android.app.TaskInfo") }
+    private val power = DisplayPower()
+    // displayId -> 保活租约到期时间（uptimeMillis）
+    private val awakeLeases = HashMap<Int, Long>()
+
+    init {
+        Thread({ keepAwakeLoop() }, "AkashicKeepAwake").apply {
+            isDaemon = true
+            start()
+        }
+    }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
         if (code in FIRST_CALL_TRANSACTION..LAST_CALL_TRANSACTION && Binder.getCallingUid() != allowedUid) {
@@ -131,8 +141,40 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         val vd = displayManager.createVirtualDisplay("akashic-agent", width, height, dpi, surface, flags)
         val id = vd.display.displayId
         synchronized(displays) { displays[id] = vd }
+        renewLease(id)
         setFullscreenAndImePolicy(id)
         return id
+    }
+
+    // 虚拟屏带 OWN_DISPLAY_GROUP，有独立电源组：主屏熄灭后它会按无操作超时单独休眠，之后只出黑帧。
+    // 每次端侧操作续一次租约，租约内每 4 秒上报一次该屏的用户活动；已经睡着就往该屏注入 WAKEUP 唤醒。
+    override fun keepAwake(displayId: Int): Boolean {
+        if (synchronized(displays) { displayId !in displays }) return false
+        renewLease(displayId)
+        power.userActivity(displayId)
+        if (power.isInteractive(displayId)) return true
+        injectKey(displayId, KeyEvent.KEYCODE_WAKEUP)
+        repeat(10) {
+            SystemClock.sleep(100L)
+            if (power.isInteractive(displayId)) return true
+        }
+        return false
+    }
+
+    private fun renewLease(displayId: Int) {
+        synchronized(awakeLeases) { awakeLeases[displayId] = SystemClock.uptimeMillis() + KEEP_AWAKE_LEASE_MS }
+    }
+
+    private fun keepAwakeLoop() {
+        while (true) {
+            SystemClock.sleep(KEEP_AWAKE_INTERVAL_MS)
+            val now = SystemClock.uptimeMillis()
+            val live = synchronized(awakeLeases) {
+                awakeLeases.entries.removeAll { it.value <= now }
+                awakeLeases.keys.toList()
+            }
+            live.forEach { power.userActivity(it) }
+        }
     }
 
     @SuppressLint("PrivateApi")
@@ -145,11 +187,13 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     override fun releaseDisplay(displayId: Int) {
+        synchronized(awakeLeases) { awakeLeases.remove(displayId) }
         val vd = synchronized(displays) { displays.remove(displayId) }
         vd?.release()
     }
 
     override fun releaseAll() {
+        synchronized(awakeLeases) { awakeLeases.clear() }
         val all = synchronized(displays) { displays.values.toList().also { displays.clear() } }
         all.forEach { runCatching { it.release() } }
     }
@@ -305,7 +349,37 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     companion object {
         private const val TAG = "AkashicShellService"
+        private const val KEEP_AWAKE_INTERVAL_MS = 4_000L
+        private const val KEEP_AWAKE_LEASE_MS = 5 * 60_000L
     }
+}
+
+// IPowerManager 按显示查询与上报用户活动（隐藏接口，UID 2000 有权限；做法同 scrcpy --keep-active）。
+@SuppressLint("PrivateApi")
+internal class DisplayPower {
+    private val service: Any? = runCatching {
+        val binder = Class.forName("android.os.ServiceManager").getMethod("getService", String::class.java)
+            .invoke(null, "power") as IBinder
+        Class.forName("android.os.IPowerManager\$Stub").getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+    }.getOrNull()
+    private val userActivityMethod = runCatching {
+        service!!.javaClass.getMethod(
+            "userActivity", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+        )
+    }.getOrNull()
+    private val interactiveMethod = runCatching {
+        service!!.javaClass.getMethod("isDisplayInteractive", Int::class.javaPrimitiveType)
+    }.getOrNull()
+
+    fun userActivity(displayId: Int) {
+        runCatching { userActivityMethod?.invoke(service, displayId, SystemClock.uptimeMillis(), 0, 0) }
+            .onFailure { Log.w("AkashicShellService", "userActivity($displayId) failed", it) }
+    }
+
+    // 查询失败时按“醒着”处理，避免误判后反复重建虚拟屏
+    fun isInteractive(displayId: Int): Boolean =
+        runCatching { interactiveMethod?.invoke(service, displayId) as? Boolean }.getOrNull() ?: true
 }
 
 object HelperMain {
