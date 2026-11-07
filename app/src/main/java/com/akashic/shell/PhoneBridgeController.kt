@@ -225,6 +225,17 @@ object PhoneBridgeController {
         }
     }
 
+    // 每次操作前给虚拟屏续保活租约；主屏熄灭期间它若已休眠且唤不醒，就释放重建一块新的。
+    private fun ensureAwakeDisplay(context: Context): Int {
+        val id = ensureVirtualDisplay(context)
+        val sh = ShellHelperHub.shell
+        if (!isTrustedVirtualDisplay || id <= 0 || sh == null) return id
+        if (runCatching { sh.keepAwake(id) }.getOrDefault(true)) return id
+        Log.i(TAG, "virtual display #$id asleep and could not be woken, recreating")
+        releaseVirtualDisplay()
+        return ensureVirtualDisplay(context)
+    }
+
     private fun releaseVirtualDisplay() {
         synchronized(this) {
             val id = virtualDisplayId
@@ -408,14 +419,14 @@ object PhoneBridgeController {
         try {
             when (op) {
                 "observe" -> {
-                    val dispId = ensureVirtualDisplay(context)
+                    val dispId = ensureAwakeDisplay(context)
                     updatePip(if (takeoverReason != null) PipMode.NEEDS_YOU else PipMode.RUNNING, "正在观察屏幕", null)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     val screen = buildScreenObject(context, dispId, wantImg)
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
-                    val dispId = ensureVirtualDisplay(context)
+                    val dispId = ensureAwakeDisplay(context)
                     val act = payload.optString("action")
                     val msg = runAction(context, dispId, act, payload)
                     val settleMs = if (act == "launch_app") 1_100L else 480L
