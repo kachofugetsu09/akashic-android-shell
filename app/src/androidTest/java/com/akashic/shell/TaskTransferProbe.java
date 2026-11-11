@@ -3,6 +3,9 @@ package com.akashic.shell;
 import android.app.Activity;
 import android.app.Instrumentation;
 import android.content.Context;
+import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
+import android.media.ImageReader;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.Parcel;
@@ -17,18 +20,24 @@ import java.util.concurrent.TimeUnit;
 
 /** Isolated Binder fault fixture; it never creates or moves a real Android task. */
 public final class TaskTransferProbe extends Instrumentation {
-    private static final int VD = 31, TASK = 42;
+    private static int VD;
+    private static final int TASK = 42;
     private final Bundle report = new Bundle();
     private Object owner;
     private Method execute;
+    private ImageReader reader;
+    private Bundle arguments;
 
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
+    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); this.arguments = arguments; start(); }
     @Override public void onStart() {
         int result = Activity.RESULT_OK;
         boolean isolated = false;
         try {
             require(getTargetContext().getPackageName().endsWith(".resumetest"), "isolated package required");
             isolated = true;
+            VD = Integer.parseInt(arguments.getString("metadata_display_id", "-1"));
+            require(VD > 0 && getTargetContext().getSystemService(DisplayManager.class).getDisplay(VD) != null,
+                    "an existing non-main metadata display is required; no task will be moved");
             Class<?> ownerType = Class.forName("com.akashic.shell.PhoneBridgeController$ConnectionOwner");
             java.lang.reflect.Constructor<?> constructor = ownerType.getDeclaredConstructors()[0];
             constructor.setAccessible(true);
@@ -53,6 +62,8 @@ public final class TaskTransferProbe extends Instrumentation {
                     field(PhoneBridgeController.class, "handedTaskId").set(null, null);
                     field(PhoneBridgeController.class, "activeOwner").set(null, null);
                     field(ShellHelperHub.class, "shell").set(null, null);
+                    setReader(null);
+                    if (reader != null) reader.close();
                 }
             } catch (ReflectiveOperationException error) {
                 report.putBoolean("ok", false);
@@ -143,6 +154,11 @@ public final class TaskTransferProbe extends Instrumentation {
     }
 
     private FaultBinder reset(boolean waiting, Integer id) throws Exception {
+        // Real geometry and reader preconditions; all task effects still end at the fault Binder.
+        setReader(null);
+        if (reader != null) reader.close();
+        reader = ImageReader.newInstance(16, 16, PixelFormat.RGBA_8888, 2);
+        setReader(reader);
         FaultBinder helper = new FaultBinder();
         field(ShellHelperHub.class, "shell").set(null, IAkashicShell.Stub.asInterface(helper));
         field(PhoneBridgeController.class, "virtualDisplayId").set(null, VD);
@@ -151,6 +167,11 @@ public final class TaskTransferProbe extends Instrumentation {
         field(PhoneBridgeController.class, "handedTaskId").set(null, id);
         field(PhoneBridgeController.class, "activeOwner").set(null, owner);
         return helper;
+    }
+    private void setReader(ImageReader value) throws ReflectiveOperationException {
+        Method method = PhoneBridgeController.class.getDeclaredMethod("setFrameReader", ImageReader.class);
+        method.setAccessible(true);
+        method.invoke(PhoneBridgeController.INSTANCE, value);
     }
     private JSONObject resume() throws Exception {
         return (JSONObject) execute.invoke(PhoneBridgeController.INSTANCE, getTargetContext(), owner,
