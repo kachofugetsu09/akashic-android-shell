@@ -3,6 +3,8 @@ package com.akashic.shell
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Point
 import android.graphics.Matrix
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -88,6 +90,8 @@ object PhoneBridgeController {
     private val frameLock = Any()
     private var frameBitmap: Bitmap? = null
     private var frameSize = 0 to 0
+    private data class DisplayGeometry(val width: Int, val height: Int, val rotation: Int)
+    private var frameGeometry: DisplayGeometry? = null
     private var frameSeq = 0L
     private var encodedSeq = -1L
     private var encodedPng: ByteArray? = null
@@ -677,14 +681,14 @@ object PhoneBridgeController {
             }
             PhoneAction.SCROLL -> {
                 val dir = payload.optString("direction", "down")
-                val dm = context.resources.displayMetrics
-                val cx = dm.widthPixels / 2
-                val h = dm.heightPixels
+                val geometry = ownedGeometry(context, dispId)
+                val cx = geometry.width / 2
+                val h = geometry.height
                 val (x1, y1, x2, y2) = when (dir) {
                     "down" -> listOf(cx, (h * 0.75f).toInt(), cx, (h * 0.25f).toInt())
                     "up" -> listOf(cx, (h * 0.25f).toInt(), cx, (h * 0.75f).toInt())
-                    "left" -> listOf((dm.widthPixels * 0.8f).toInt(), h / 2, (dm.widthPixels * 0.2f).toInt(), h / 2)
-                    else -> listOf((dm.widthPixels * 0.2f).toInt(), h / 2, (dm.widthPixels * 0.8f).toInt(), h / 2)
+                    "left" -> listOf((geometry.width * 0.8f).toInt(), h / 2, (geometry.width * 0.2f).toInt(), h / 2)
+                    else -> listOf((geometry.width * 0.2f).toInt(), h / 2, (geometry.width * 0.8f).toInt(), h / 2)
                 }
                 advanceFrameWatermark()
                 check(sh != null && sh.injectSwipe(dispId, x1, y1, x2, y2, 320)) { "后台滚动未被接受" }
@@ -837,6 +841,7 @@ object PhoneBridgeController {
         imageReader = reader
         readerCreatedNanos = if (reader != null) System.nanoTime() else 0L
         frameTimestampNanos = 0L
+        frameGeometry = null
         requiredFrameNanos = 0L
         requiredScreenshotUptimeMs = if (reader != null) SystemClock.uptimeMillis() else 0L
         frameClockError = null
@@ -967,14 +972,51 @@ object PhoneBridgeController {
         null
     }
 
+    /** 逻辑尺寸和方向属于 owned Display，不能借用 Shell Activity 所在屏幕的 metrics。 */
+    private fun ownedGeometry(context: Context, displayId: Int): DisplayGeometry {
+        check(displayId > Display.DEFAULT_DISPLAY && displayId == virtualDisplayId && isTrustedVirtualDisplay) {
+            "PHONE_DISPLAY_OWNER_LOST: 后台显示器身份已变化"
+        }
+        val display = checkNotNull(context.getSystemService(DisplayManager::class.java).getDisplay(displayId)) {
+            "PHONE_DISPLAY_GONE: 后台显示器已消失，请结束后重新创建"
+        }
+        val size = Point()
+        display.getRealSize(size)
+        check(size.x > 0 && size.y > 0) { "PHONE_DISPLAY_GEOMETRY: 后台逻辑尺寸无效" }
+        val geometry = DisplayGeometry(size.x, size.y, display.rotation)
+        synchronized(frameLock) {
+            if (frameGeometry != null && frameGeometry != geometry) {
+                // 外部 resize/旋转也使旧投影失效；恢复原尺寸不能复活旧 letterbox/180° 图片。
+                advanceFrameWatermark()
+                encodedSeq = -1L
+                encodedPng = null
+                latestPreviewPng = null
+            }
+            frameGeometry = geometry
+        }
+        return geometry
+    }
+
+    private fun ownedFrameReader(displayId: Int): ImageReader = synchronized(frameLock) {
+        check(displayId > Display.DEFAULT_DISPLAY && displayId == virtualDisplayId && isTrustedVirtualDisplay) {
+            "PHONE_FRAME_OWNER_LOST: 没有 owned 后台截图目标，未读取主屏"
+        }
+        checkNotNull(imageReader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
+    }
+
+    /** 几何不一致时只接受逻辑 layer 截图，不猜测 raw letterbox 或旋转矩阵。 */
+    private fun captureLogicalPng(displayId: Int, accessibility: AkashicAccessibilityService?): ByteArray {
+        val reader = ownedFrameReader(displayId)
+        val screenshot = checkNotNull(accessibility?.captureScreenshotPng(displayId)) {
+            "PHONE_SCREENSHOT_GEOMETRY: 无法取得后台逻辑截图；未返回投影不一致的 raw 图片"
+        }
+        return acceptAccessibilityScreenshot(reader, screenshot)
+            ?: error("PHONE_FRAME_NOT_FRESH: 后台逻辑截图未超过当前水位，请重新观察")
+    }
+
     /** raw 和无障碍截图各自验证生产时间；成功的 fallback 不改变旧 raw 的有效性。 */
     private fun captureDisplayPng(displayId: Int, accessibility: AkashicAccessibilityService?): ByteArray {
-        val reader = synchronized(frameLock) {
-            check(displayId > Display.DEFAULT_DISPLAY && displayId == virtualDisplayId && isTrustedVirtualDisplay) {
-                "PHONE_FRAME_OWNER_LOST: 没有 owned 后台截图目标，未读取主屏"
-            }
-            checkNotNull(imageReader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
-        }
+        val reader = ownedFrameReader(displayId)
         val deadline = SystemClock.uptimeMillis() + 5_000L
         encodeFullPng(reader)?.let { return it }
         val screenshot = try {
@@ -991,29 +1033,42 @@ object PhoneBridgeController {
     private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): JSONObject {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
-        val dm = context.resources.displayMetrics
-        val readout = a11y?.dumpScreen(dispId)
+        val geometry = if (dispId > Display.DEFAULT_DISPLAY) ownedGeometry(context, dispId) else DisplayGeometry(0, 0, 0)
+        val readout = if (dispId > Display.DEFAULT_DISPLAY) a11y?.dumpScreen(dispId) else null
         lastNodeRefs = readout?.nodeRefs ?: emptyMap()
         val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
-        val resolvedPkg = topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
+        val resolvedPkg = if (dispId <= Display.DEFAULT_DISPLAY) "" else topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
             ?: readout?.packageName
             ?: activePackages.lastOrNull()
             ?: "com.akashic.shell"
-        val resolvedAct = topComp?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }
+        val resolvedAct = if (dispId <= Display.DEFAULT_DISPLAY) "" else topComp?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }
             ?: readout?.activityName
             ?: "MainActivity"
 
-        val returnedPng = if (includeScreenshot) captureDisplayPng(dispId, a11y) else null
+        val returnedPng = if (includeScreenshot && dispId > Display.DEFAULT_DISPLAY) {
+            val reader = ownedFrameReader(dispId)
+            val natural = geometry.rotation == 0 && reader.width == geometry.width && reader.height == geometry.height
+            val png = if (natural) captureDisplayPng(dispId, a11y) else captureLogicalPng(dispId, a11y)
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(png, 0, png.size, options)
+            check(options.outWidth == geometry.width && options.outHeight == geometry.height) {
+                "PHONE_SCREENSHOT_GEOMETRY: 图片尺寸 ${options.outWidth}x${options.outHeight} 不等于后台逻辑尺寸 ${geometry.width}x${geometry.height}；未返回图片"
+            }
+            png
+        } else null
+        check(dispId <= Display.DEFAULT_DISPLAY || ownedGeometry(context, dispId) == geometry) {
+            "PHONE_DISPLAY_GEOMETRY_CHANGED: 观察期间后台几何已变化，请重新观察；不会重发动作"
+        }
 
         return JSONObject()
             .put("display_id", dispId)
-            .put("width", dm.widthPixels.takeIf { it > 0 } ?: 1080)
-            .put("height", dm.heightPixels.takeIf { it > 0 } ?: 2400)
-            .put("rotation", 0)
+            .put("width", geometry.width)
+            .put("height", geometry.height)
+            .put("rotation", geometry.rotation)
             .put("package_name", resolvedPkg)
             .put("activity_name", resolvedAct)
             .put("pip_state", pipMode.id)
-            .put("audio_muted", true)
+            .put("audio_muted", false)
             .put("nodes", readout?.nodes ?: JSONArray())
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
             .apply {
