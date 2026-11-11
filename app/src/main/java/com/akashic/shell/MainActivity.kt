@@ -79,10 +79,10 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     override fun onResume() {
         super.onResume()
         ShellStatus.listener = ::refreshPanel
-        PhoneBridgeController.pipListener = { mode, label, png ->
-            pipView.updateState(mode, label, png)
+        PhoneBridgeController.pipListener = { _, _, _ ->
+            pipView.updateState(PhoneBridgeController::currentPipState)
         }
-        pipView.updateState(PhoneBridgeController.pipMode, PhoneBridgeController.pipLabel, PhoneBridgeController.latestPreviewPng)
+        pipView.updateState(PhoneBridgeController::currentPipState)
         NotifyService.sync(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()

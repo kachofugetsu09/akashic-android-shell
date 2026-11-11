@@ -8,6 +8,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
@@ -66,8 +67,6 @@ object PhoneBridgeController {
     @Volatile var isTrustedVirtualDisplay: Boolean = false
         private set
     @Volatile var latestPreviewPng: ByteArray? = null
-        private set
-    @Volatile var latestFullPng: ByteArray? = null
         private set
 
     var pipListener: ((PipMode, String, ByteArray?) -> Unit)? = null
@@ -157,11 +156,19 @@ object PhoneBridgeController {
     }
 
     private fun updatePip(mode: PipMode, label: String, png: ByteArray?) {
-        pipMode = mode
-        pipLabel = label
-        if (png != null) latestPreviewPng = png
-        pipListener?.invoke(mode, label, png ?: latestPreviewPng)
+        synchronized(frameLock) {
+            pipMode = mode
+            pipLabel = label
+            // DONE 可保留刚释放屏幕的末帧，其它模式不能借用已退役 reader 的图。
+            if (imageReader == null && mode != PipMode.DONE) latestPreviewPng = null
+            if (png != null) latestPreviewPng = png
+            pipListener?.invoke(mode, label, latestPreviewPng)
+        }
         ShellStatus.notifyChanged()
+    }
+
+    fun currentPipState(): Triple<PipMode, String, ByteArray?> = synchronized(frameLock) {
+        Triple(pipMode, pipLabel, latestPreviewPng)
     }
 
     private fun ensureVirtualDisplay(context: Context): Int {
@@ -183,33 +190,37 @@ object PhoneBridgeController {
             val ht = HandlerThread("akashic-vd").apply { start() }
             val hnd = Handler(ht.looper)
             val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+            setFrameReader(reader)
             var lastPreviewMs = 0L
             reader.setOnImageAvailableListener({ r ->
-                val img = runCatching { r.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
-                try {
-                    val plane = img.planes[0]
-                    val strideWidth = plane.rowStride / plane.pixelStride
-                    synchronized(frameLock) {
-                        val buf = frameBitmap?.takeIf { it.width == strideWidth && it.height == h }
-                            ?: Bitmap.createBitmap(strideWidth, h, Bitmap.Config.ARGB_8888).also {
-                                frameBitmap?.recycle()
-                                frameBitmap = it
-                            }
-                        buf.copyPixelsFromBuffer(plane.buffer.rewind())
-                        frameSize = w to h
-                        frameSeq++
+                val img = try {
+                    r.acquireLatestImage()
+                } catch (error: IllegalStateException) {
+                    // release 可与 acquire 并发；只有已退役 reader 的关闭异常可忽略。
+                    if (synchronized(frameLock) { imageReader === r }) {
+                        recordError("后台帧读取失败: ${error.message}")
                     }
+                    return@setOnImageAvailableListener
+                } ?: return@setOnImageAvailableListener
+                try {
+                    if (!copyFrame(r, img, w, h)) return@setOnImageAvailableListener
                     val now = SystemClock.uptimeMillis()
                     if (now - lastPreviewMs >= PREVIEW_INTERVAL_MS || latestPreviewPng == null) {
                         lastPreviewMs = now
-                        latestPreviewPng = encodePreview()
-                        if (pipMode != PipMode.HIDDEN) {
-                            pipListener?.invoke(pipMode, pipLabel, latestPreviewPng)
+                        encodePreview(r)?.let { publishPreview(r, it) }
+                    }
+                } catch (error: RuntimeException) {
+                    if (synchronized(frameLock) { imageReader === r }) {
+                        recordError("后台帧处理失败: ${error.message}")
+                    }
+                } finally {
+                    try {
+                        img.close()
+                    } catch (error: IllegalStateException) {
+                        if (synchronized(frameLock) { imageReader === r }) {
+                            recordError("后台帧关闭失败: ${error.message}")
                         }
                     }
-                } catch (_: Throwable) {
-                } finally {
-                    img.close()
                 }
             }, hnd)
 
@@ -224,13 +235,13 @@ object PhoneBridgeController {
                 if (id > 0) {
                     displayThread = ht
                     displayHandler = hnd
-                    imageReader = reader
                     virtualDisplayId = id
                     isTrustedVirtualDisplay = true
                     return id
                 }
             }
 
+            setFrameReader(null)
             reader.close()
             ht.quitSafely()
             error("后台手机控制未就绪：请连接 UID 2000 助手并确认设备支持独立显示器；未接管主屏")
@@ -248,8 +259,16 @@ object PhoneBridgeController {
         return id
     }
 
-    private fun releaseVirtualDisplay() {
-        synchronized(this) {
+    private fun releaseVirtualDisplay(): ByteArray? {
+        return synchronized(this) {
+            // 先撤销帧 owner，旧回调和锁外 PNG 编码完成后也不能重新发布。
+            val retiredReader: ImageReader?
+            val finalPreview: ByteArray?
+            synchronized(frameLock) {
+                retiredReader = imageReader
+                finalPreview = if (retiredReader != null) latestPreviewPng else null
+                setFrameReader(null)
+            }
             val id = virtualDisplayId
             if (isTrustedVirtualDisplay && id != null && id > 0) {
                 runCatching { ShellHelperHub.shell?.releaseDisplay(id) }
@@ -258,8 +277,7 @@ object PhoneBridgeController {
             localVirtualDisplay = null
             virtualDisplayId = null
             isTrustedVirtualDisplay = false
-            imageReader?.close()
-            imageReader = null
+            retiredReader?.close()
             displayThread?.quitSafely()
             displayThread = null
             displayHandler = null
@@ -267,14 +285,7 @@ object PhoneBridgeController {
             lastNodeRefs = emptyMap()
             takeoverReason = null
             takeoverPackage = null
-            latestFullPng = null
-            synchronized(frameLock) {
-                frameBitmap?.recycle()
-                frameBitmap = null
-                frameSeq = 0L
-                encodedSeq = -1L
-                encodedPng = null
-            }
+            finalPreview
         }
     }
 
@@ -578,8 +589,8 @@ object PhoneBridgeController {
                     ).put("state", currentStateJson(context))
                 }
                 "finish" -> {
-                    releaseVirtualDisplay()
-                    updatePip(PipMode.DONE, "已完成", null)
+                    val finalPreview = releaseVirtualDisplay()
+                    updatePip(PipMode.DONE, "已完成", finalPreview)
                     Handler(Looper.getMainLooper()).postDelayed({
                         if (pipMode == PipMode.DONE) updatePip(PipMode.HIDDEN, "后台待命", null)
                     }, 2_200L)
@@ -800,35 +811,81 @@ object PhoneBridgeController {
         return action
     }
 
-    private fun hasFrame(): Boolean = synchronized(frameLock) { frameBitmap != null } || latestFullPng != null
+    /** raw 和编码缓存只属于当前 reader，释放或换代时一起失效。 */
+    private fun setFrameReader(reader: ImageReader?) = synchronized(frameLock) {
+        imageReader = reader
+        frameBitmap?.recycle()
+        frameBitmap = null
+        frameSize = 0 to 0
+        frameSeq = 0L
+        encodedSeq = -1L
+        encodedPng = null
+        latestPreviewPng = null
+    }
+
+    private fun copyFrame(reader: ImageReader, image: Image, width: Int, height: Int): Boolean = synchronized(frameLock) {
+        if (imageReader !== reader) return false
+        val plane = image.planes[0]
+        val strideWidth = plane.rowStride / plane.pixelStride
+        val buf = frameBitmap?.takeIf { it.width == strideWidth && it.height == height }
+            ?: Bitmap.createBitmap(strideWidth, height, Bitmap.Config.ARGB_8888).also {
+                frameBitmap?.recycle()
+                frameBitmap = it
+            }
+        buf.copyPixelsFromBuffer(plane.buffer.rewind())
+        frameSize = width to height
+        frameSeq++
+        true
+    }
+
+    private fun hasFrame(reader: ImageReader): Boolean = synchronized(frameLock) {
+        imageReader === reader && frameBitmap != null
+    }
 
     // 按需把最新一帧编码成整屏 PNG；同一帧只编码一次。
-    private fun encodeFullPng(): ByteArray? {
+    private fun encodeFullPng(reader: ImageReader): ByteArray? {
         synchronized(frameLock) {
-            val src = frameBitmap ?: return latestFullPng
+            if (imageReader !== reader) return null
+            val src = frameBitmap ?: return null
             if (encodedSeq == frameSeq) return encodedPng
             val (w, h) = frameSize
             val full = Bitmap.createBitmap(src, 0, 0, w, h)
             val out = ByteArrayOutputStream()
-            full.compress(Bitmap.CompressFormat.PNG, 90, out)
-            if (full !== src) full.recycle()
-            encodedSeq = frameSeq
-            encodedPng = out.toByteArray()
-            return encodedPng
+            try {
+                check(full.compress(Bitmap.CompressFormat.PNG, 90, out)) { "后台整屏 PNG 编码失败" }
+                encodedSeq = frameSeq
+                encodedPng = out.toByteArray()
+                return encodedPng
+            } finally {
+                if (full !== src) full.recycle()
+            }
         }
     }
 
-    private fun encodePreview(): ByteArray? {
+    private fun encodePreview(reader: ImageReader): Pair<Long, ByteArray>? {
+        var seq: Long
         val scaled = synchronized(frameLock) {
+            if (imageReader !== reader) return null
             val src = frameBitmap ?: return null
+            seq = frameSeq
             val (w, h) = frameSize
             val scale = 360f / w
             Bitmap.createBitmap(src, 0, 0, w, h, Matrix().apply { setScale(scale, scale) }, true)
         }
         val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.PNG, 85, out)
-        scaled.recycle()
-        return out.toByteArray()
+        try {
+            check(scaled.compress(Bitmap.CompressFormat.PNG, 85, out)) { "后台预览 PNG 编码失败" }
+            return seq to out.toByteArray()
+        } finally {
+            scaled.recycle()
+        }
+    }
+
+    /** 缩放和 PNG 编码可在锁外完成，发布前必须再次核对 reader 和帧。 */
+    private fun publishPreview(reader: ImageReader, preview: Pair<Long, ByteArray>) = synchronized(frameLock) {
+        if (imageReader !== reader || frameSeq != preview.first) return
+        latestPreviewPng = preview.second
+        if (pipMode != PipMode.HIDDEN) pipListener?.invoke(pipMode, pipLabel, preview.second)
     }
 
     private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): JSONObject {
@@ -848,16 +905,12 @@ object PhoneBridgeController {
 
         // 实时捕获截图并同时刷新右下角画中画小窗（解决小窗黑屏与截图空白问题）
         val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && dispId > 0) {
-            if (!hasFrame()) SystemClock.sleep(280L)
-            if (includeScreenshot) encodeFullPng() ?: a11y?.captureScreenshotPng(dispId) else null
+            val reader = synchronized(frameLock) { imageReader }
+            if (reader != null && !hasFrame(reader)) SystemClock.sleep(280L)
+            if (includeScreenshot && reader != null) encodeFullPng(reader) ?: a11y?.captureScreenshotPng(dispId) else null
         } else {
-            val a11yPng = a11y?.captureScreenshotPng(Display.DEFAULT_DISPLAY)
-            if (a11yPng != null && a11yPng.isNotEmpty()) {
-                latestFullPng = a11yPng
-                latestPreviewPng = a11yPng
-                pipListener?.invoke(pipMode, pipLabel, a11yPng)
-            }
-            a11yPng ?: latestFullPng
+            // 非 reader 来源的单次截图不写入虚拟屏缓存，也不以旧图掩盖失败。
+            a11y?.captureScreenshotPng(Display.DEFAULT_DISPLAY)
         }
         val returnedPng = if (includeScreenshot) pngBytes else null
 
