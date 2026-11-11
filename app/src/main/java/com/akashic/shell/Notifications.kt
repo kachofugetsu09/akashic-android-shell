@@ -23,6 +23,7 @@ enum class ConnectionState(val label: String) {
     FAILED("通知数据异常，请查看日志并重新连接"),
     UNSUPPORTED("服务器版本暂不支持通知"),
     LOGIN_REQUIRED("需要登录：打开 Akashic 登录后自动恢复"),
+    BACKGROUND_BLOCKED("系统限制后台启动，请打开应用后重试"),
 }
 
 // 进程内共享的壳状态：前台可见性和通知连接状态。
