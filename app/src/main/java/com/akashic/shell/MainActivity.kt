@@ -357,7 +357,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun setPhoneUse(enable: Boolean) {
         prefs.setPhoneUseEnabled(enable)
-        PhoneBridgeController.sync(this)
+        NotifyService.sync(this)
         refreshPanel()
     }
 

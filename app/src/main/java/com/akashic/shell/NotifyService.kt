@@ -1,5 +1,6 @@
 package com.akashic.shell
 
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
@@ -23,10 +24,11 @@ private sealed interface StreamOutcome {
     data object LoginRequired : StreamOutcome
 }
 
-// 前台服务只订阅服务端的通知流：收到提醒就弹系统通知，不同步任何聊天内容。
+// 一个前台服务承载通知订阅和后台手机控制；通知关闭不影响已启用的手机控制。
 class NotifyService : Service() {
     private val wake = Object()
     @Volatile private var running = false
+    @Volatile private var notificationsEnabled = false
     @Volatile private var connection: HttpURLConnection? = null
     @Volatile private var worker: Thread? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -41,17 +43,27 @@ class NotifyService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = Notifications.ongoing(this, ShellStatus.connection)
+        val wasEnabled = notificationsEnabled
+        notificationsEnabled = shouldSubscribe(this)
+        if (!notificationsEnabled) ShellStatus.update(ConnectionState.STOPPED)
+        val notification = ongoingNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(Notifications.ONGOING_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         } else {
             startForeground(Notifications.ONGOING_ID, notification)
         }
-        if (worker == null) {
+        // 系统以 null intent 重建 sticky 服务时，也必须恢复控制桥。
+        PhoneBridgeController.sync(this)
+        if (!shouldRun(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (notificationsEnabled && worker == null) {
             running = true
             if (networkCallback == null) registerNetworkCallback()
             worker = Thread(::runLoop, "akashic-notify").apply { isDaemon = true; start() }
-        } else if (intent?.action == ACTION_RECONNECT) {
+        } else if (!notificationsEnabled || !wasEnabled || intent?.action == ACTION_RECONNECT) {
+            // 暂停同一个线程，避免快速关开时旧线程随共享 running 标志复活。
             wakeUp(abort = true)
         }
         return START_STICKY
@@ -59,6 +71,8 @@ class NotifyService : Service() {
 
     override fun onDestroy() {
         running = false
+        notificationsEnabled = false
+        PhoneBridgeController.stop()
         networkCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         wakeUp(abort = true)
         ShellStatus.update(ConnectionState.STOPPED)
@@ -69,6 +83,7 @@ class NotifyService : Service() {
     private fun runLoop() {
         var failures = 0
         while (running) {
+            if (!waitForNotifications()) break
             val server = prefs.serverUrl ?: break
             setState(if (failures == 0) ConnectionState.CONNECTING else ConnectionState.RETRYING)
             val outcome = try {
@@ -82,6 +97,8 @@ class NotifyService : Service() {
             } catch (error: DateTimeParseException) {
                 return fail(error)
             }
+            if (!running) break
+            if (!notificationsEnabled) continue
             // 地址变化不继承旧服务器的失败或不支持等待。
             if (server != prefs.serverUrl) {
                 failures = 0
@@ -105,6 +122,7 @@ class NotifyService : Service() {
     private fun streamOnce(server: String): StreamOutcome {
         var requestReadEvents = true
         while (true) {
+            if (!running || !notificationsEnabled) return StreamOutcome.Dropped(established = false)
             val current = try {
                 Server.open("$server/api/chat/notifications/stream", readTimeoutMs = READ_TIMEOUT_MS)
             } catch (_: IOException) {
@@ -118,6 +136,7 @@ class NotifyService : Service() {
             CookieManager.getInstance().getCookie(server)?.let { current.setRequestProperty("Cookie", it) }
             connection = current
             try {
+                if (!running || !notificationsEnabled) return StreamOutcome.Dropped(established = false)
                 val body = JSONObject().put("cursor", prefs.notificationCursor ?: JSONObject.NULL)
                 if (requestReadEvents) body.put("read_events", true)
                 current.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
@@ -151,7 +170,7 @@ class NotifyService : Service() {
         val data = StringBuilder()
         try {
             current.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                while (running && server == prefs.serverUrl) {
+                while (running && notificationsEnabled && server == prefs.serverUrl) {
                     val line = reader.readLine() ?: break
                     when {
                         line.isEmpty() -> {
@@ -171,7 +190,7 @@ class NotifyService : Service() {
 
     // 先交给系统通知，再保存进度；中途退出允许重放，不能跳过提醒。
     private fun dispatch(event: String, data: String, server: String): Boolean {
-        if (!running || server != prefs.serverUrl) return false
+        if (!running || !notificationsEnabled || server != prefs.serverUrl) return false
         val json = JSONObject(data)
         when (event) {
             "ready" -> {
@@ -189,8 +208,9 @@ class NotifyService : Service() {
                 val seen = prefs.notificationCursor?.optLong(item.sessionId, -1) ?: -1
                 if (seq > seen) {
                     if (!Notifications.showMessage(this, item)) {
-                        running = false
-                        stopSelf()
+                        notificationsEnabled = false
+                        setState(ConnectionState.STOPPED)
+                        if (!prefs.phoneUseEnabled) stopSelf()
                         return false
                     }
                     prefs.advanceCursor(server, item.sessionId, seq)
@@ -206,7 +226,7 @@ class NotifyService : Service() {
 
     private fun fail(error: Exception) {
         Log.e("AkashicNotify", "通知停止，保留原进度", error)
-        setState(ConnectionState.FAILED)
+        if (running && notificationsEnabled) setState(ConnectionState.FAILED)
         worker = null
     }
 
@@ -214,7 +234,19 @@ class NotifyService : Service() {
         if (state == ShellStatus.connection) return
         ShellStatus.update(state)
         getSystemService(NotificationManager::class.java)
-            .notify(Notifications.ONGOING_ID, Notifications.ongoing(this, state))
+            .notify(Notifications.ONGOING_ID, ongoingNotification())
+    }
+
+    private fun ongoingNotification(): Notification {
+        val notification = Notifications.ongoing(this, ShellStatus.connection)
+        return if (!notificationsEnabled && prefs.phoneUseEnabled) {
+            Notification.Builder.recoverBuilder(this, notification).setContentText("后台手机控制已启用").build()
+        } else notification
+    }
+
+    private fun waitForNotifications(): Boolean = synchronized(wake) {
+        while (running && !notificationsEnabled) wake.wait()
+        running
     }
 
     private fun pause(millis: Long) {
@@ -247,11 +279,13 @@ class NotifyService : Service() {
 
         fun shouldRun(context: Context): Boolean {
             val prefs = ShellPrefs(context)
-            return prefs.serverUrl != null && prefs.notificationsWanted && Notifications.canPost(context)
+            return prefs.serverUrl != null && (prefs.phoneUseEnabled || shouldSubscribe(context))
         }
 
+        private fun shouldSubscribe(context: Context): Boolean =
+            ShellPrefs(context).notificationsWanted && Notifications.canPost(context)
+
         fun sync(context: Context) {
-            PhoneBridgeController.sync(context)
             if (shouldRun(context)) {
                 context.startForegroundService(Intent(context, NotifyService::class.java))
             } else {
@@ -261,13 +295,14 @@ class NotifyService : Service() {
 
         // 页面登录成功后调用：只唤醒正在等待登录的连接，不打断正常接收。
         fun resumeAfterLogin(context: Context) {
-            PhoneBridgeController.sync(context)
-            if (ShellStatus.connection == ConnectionState.LOGIN_REQUIRED) reconnect(context)
+            if (ShellStatus.connection == ConnectionState.LOGIN_REQUIRED) reconnect(context) else sync(context)
         }
 
         fun reconnect(context: Context) {
-            PhoneBridgeController.sync(context)
-            if (!shouldRun(context)) return
+            if (!shouldRun(context)) {
+                sync(context)
+                return
+            }
             context.startForegroundService(Intent(context, NotifyService::class.java).setAction(ACTION_RECONNECT))
         }
     }
