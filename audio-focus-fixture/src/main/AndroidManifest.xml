@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <application android:label="Silent focus fixture" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:allowBackup="false">
+        <activity android:name=".FocusActivity" android:exported="true" android:permission="android.permission.DUMP" />
+        <service android:name=".FocusService" android:exported="true" android:permission="android.permission.DUMP" android:foregroundServiceType="mediaPlayback" />
+        <provider android:name=".EventProvider" android:authorities="${applicationId}.events" android:exported="true" android:permission="android.permission.DUMP" />
+    </application>
+</manifest>
