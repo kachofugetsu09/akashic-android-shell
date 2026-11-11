@@ -79,6 +79,10 @@ class NotifyLifecycleProbe : Instrumentation() {
             result.putString("report", report.toString())
             finish(Activity.RESULT_OK, result)
         } catch (error: Throwable) {
+            ShellPrefs(targetContext).apply {
+                setPhoneUseEnabled(false)
+                setNotificationsWanted(false)
+            }
             targetContext.stopService(Intent(targetContext, NotifyService::class.java))
             result.putString("ok", "false")
             result.putString("error", error.stackTraceToString())
