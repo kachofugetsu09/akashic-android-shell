@@ -67,6 +67,7 @@ public final class FrameOwnerProbe {
                     bytes.put(offset + 3, (byte) 255);
                 }
             }
+            image.setTimestamp(System.nanoTime());
             writer.queueInputImage(image);
             long deadline = SystemClock.uptimeMillis() + 2_000;
             Image received;

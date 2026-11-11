@@ -27,6 +27,8 @@ data class ScreenReadout(
     val nodeRefs: Map<Int, AccessibilityNodeInfo>,
 )
 
+data class CapturedScreenshot(val png: ByteArray, val uptimeMs: Long)
+
 class AkashicAccessibilityService : AccessibilityService() {
     @Volatile var lastPackage: String = "com.akashic.shell"
         private set
@@ -211,46 +213,49 @@ class AkashicAccessibilityService : AccessibilityService() {
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
-    fun captureScreenshotPng(displayId: Int): ByteArray? {
+    fun captureScreenshotPng(displayId: Int): CapturedScreenshot? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         val latch = CountDownLatch(1)
-        val ref = AtomicReference<ByteArray?>(null)
+        val ref = AtomicReference<CapturedScreenshot?>(null)
+        val failure = AtomicReference<RuntimeException?>(null)
         try {
             takeScreenshot(
                 displayId,
                 screenshotExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
+                        val buffer = screenshot.hardwareBuffer
                         try {
-                            val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                            val hw = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
                             if (hw != null) {
-                                val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
-                                hw.recycle()
-                                screenshot.hardwareBuffer.close()
+                                val sw = try { hw.copy(Bitmap.Config.ARGB_8888, false) } finally { hw.recycle() }
                                 if (sw != null) {
-                                    val out = ByteArrayOutputStream()
-                                    sw.compress(Bitmap.CompressFormat.PNG, 90, out)
-                                    sw.recycle()
-                                    ref.set(out.toByteArray())
+                                    try {
+                                        val out = ByteArrayOutputStream()
+                                        check(sw.compress(Bitmap.CompressFormat.PNG, 90, out)) { "无障碍截图 PNG 编码失败" }
+                                        ref.set(CapturedScreenshot(out.toByteArray(), screenshot.timestamp))
+                                    } finally { sw.recycle() }
                                 }
-                            } else {
-                                screenshot.hardwareBuffer.close()
                             }
-                        } catch (_: Throwable) {
+                        } catch (error: RuntimeException) {
+                            failure.set(error)
                         } finally {
+                            buffer.close()
                             latch.countDown()
                         }
                     }
 
                     override fun onFailure(errorCode: Int) {
+                        failure.set(IllegalStateException("PHONE_SCREENSHOT_FAILED: code=$errorCode"))
                         latch.countDown()
                     }
                 },
             )
             latch.await(5, TimeUnit.SECONDS)
-        } catch (_: Throwable) {
-            return null
+        } catch (error: RuntimeException) {
+            throw IllegalStateException("PHONE_SCREENSHOT_FAILED: ${error.message}", error)
         }
+        failure.get()?.let { throw it }
         return ref.get()
     }
 
