@@ -595,11 +595,15 @@ object PhoneBridgeController {
                     val dispId = if (act == PhoneAction.HAND_TO_USER) virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
                     lap("awake")
                     val generation = displayGeneration
-                    val msg = runAction(context, dispId, act, payload)
+                    val result = runAction(context, dispId, act, payload)
                     lap("action")
-                    val settleMs = if (act == PhoneAction.LAUNCH_APP) 1_100L else 480L
-                    SystemClock.sleep(settleMs)
                     val wantImg = payload.optBoolean("include_screenshot", false)
+                    val settleMs = when {
+                        act == PhoneAction.LAUNCH_APP -> 1_100L
+                        result.textReadBack && !wantImg -> 0L
+                        else -> 480L
+                    }
+                    SystemClock.sleep(settleMs)
                     var captured = buildScreenObject(context, dispId, wantImg)
                     if (act == PhoneAction.LAUNCH_APP && (captured.json.optJSONArray("nodes")?.length() ?: 0) == 0) {
                         SystemClock.sleep(800L)
@@ -609,7 +613,7 @@ object PhoneBridgeController {
                     lap("screen")
                     response.put("ok", true).put(
                         "result",
-                        JSONObject().put("message", msg).put("screen", screen),
+                        JSONObject().put("message", result.message).put("screen", screen),
                     ).put("state", currentStateJson(context))
                 }
                 "finish" -> {
@@ -639,12 +643,16 @@ object PhoneBridgeController {
         return response.put("timing", timing)
     }
 
-    private fun runAction(context: Context, dispId: Int, action: PhoneAction, payload: JSONObject): String {
+    private data class ActionResult(val message: String, val textReadBack: Boolean)
+
+    /** 执行动作，只把实时读回一致的输入标记为已确认。 */
+    private fun runAction(context: Context, dispId: Int, action: PhoneAction, payload: JSONObject): ActionResult {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
         val backgroundDisplay = sh != null && isTrustedVirtualDisplay && dispId > Display.DEFAULT_DISPLAY
         check(backgroundDisplay || action == PhoneAction.HAND_TO_USER) { "后台显示器已失效，未接管主屏" }
-        return when (action) {
+        var textReadBack = false
+        val message = when (action) {
             PhoneAction.LAUNCH_APP -> {
                 val pkg = payload.getString("package_name")
                 val code = checkNotNull(sh) { "后台助手未连接" }.startApp(dispId, pkg)
@@ -684,6 +692,9 @@ object PhoneBridgeController {
                 check(a11y != null && a11y.setNodeText(target, text)) {
                     "输入框拒绝 ACTION_SET_TEXT；未覆盖用户剪贴板，请使用应用支持的输入方式"
                 }
+                // SET_TEXT 被接受不等于值已生效；只对同一后台窗口的精确读回免去固定等待。
+                textReadBack = target.refresh() && target.isVisibleToUser &&
+                    target.window?.displayId == dispId && target.text?.toString() == text
                 updatePip(PipMode.RUNNING, "输入文本", null)
                 if (action == PhoneAction.CLEAR_TEXT) "已清空输入框" else "已输入文本 (${text.length} 字)"
             }
@@ -762,6 +773,7 @@ object PhoneBridgeController {
                 "已完成等待"
             }
         }
+        return ActionResult(message, textReadBack)
     }
 
     /** 先核对快照身份，再读取短编号；缺失引用不会借用最新快照。 */
