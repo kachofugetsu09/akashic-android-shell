@@ -11,6 +11,7 @@ android {
         applicationId = "com.akashic.shell"
         minSdk = 30
         targetSdk = 36
+        testInstrumentationRunner = "com.akashic.shell.AdbIdentityProbe"
         versionCode = 14
         versionName = "0.4.2"
     }
