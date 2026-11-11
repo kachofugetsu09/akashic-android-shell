@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "AkashicShell"
 include(":app")
+include(":eval-fixture")
