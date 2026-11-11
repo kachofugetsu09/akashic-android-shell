@@ -728,7 +728,7 @@ object ShellHelperHub {
                     val apk = context.applicationInfo.sourceDir
                     val pkg = context.packageName
                     val uid = Process.myUid()
-                    val cmd = "(setprop service.adb.tcp.port 5555 >/dev/null 2>&1 || true; CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
+                    val cmd = "(CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)
                     }
