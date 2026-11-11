@@ -105,11 +105,9 @@ class AgentPipView(
         post {
             // UI 队列执行时再读当前状态，不能重绘排队期间已退役的屏幕。
             val (newMode, label, pngBytes) = readState()
-            val previousFrame = frame
             frame = pngBytes?.takeIf { it.isNotEmpty() }?.let {
                 BitmapFactory.decodeByteArray(it, 0, it.size)
             }
-            if (previousFrame !== frame) previousFrame?.recycle()
             mode = newMode
             statusText = label
             if (newMode == PipMode.HIDDEN) {
