@@ -32,6 +32,8 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
@@ -504,7 +506,9 @@ object ShellHelperHub {
         private set
     @Volatile var pairingInProgress: Boolean = false
         private set
-    private var handoffLatch: CountDownLatch? = null
+    @Volatile private var handoffLatch: CountDownLatch? = null
+    private val startLock = Any()
+    private var startTask: FutureTask<Unit>? = null
 
     fun acceptBinder(binder: IBinder): Bundle {
         val iface = IAkashicShell.Stub.asInterface(binder)
@@ -529,11 +533,20 @@ object ShellHelperHub {
         }
     }
 
+    /** 多次同步只预留一个后台启动任务。 */
     fun tryAutoStartIfPaired(context: Context) {
-        if (shell != null) return
-        Thread({
-            runCatching { launchHelperOverAdb(context) }
-        }, "AkashicHelperAutoStart").start()
+        // 先预留启动任务，重复 sync 不再创建等待同一次启动的线程。
+        synchronized(startLock) {
+            if (shell != null || startTask != null) return
+            val task = newStart(context)
+            var started = false
+            try {
+                Thread({ runCatching { runStart(task) } }, "AkashicHelperAutoStart").start()
+                started = true
+            } finally {
+                if (!started) task.cancel(false)
+            }
+        }
     }
 
     fun pairAndStart(context: Context, rawCode: String, manualPort: Int?, onDone: (Boolean, String) -> Unit) {
@@ -569,8 +582,40 @@ object ShellHelperHub {
         }, "AkashicAdbPair").start()
     }
 
-    @SuppressLint("PrivateApi")
+    /** 配对与自动启动共享任务，等待不占用启动锁。 */
     fun launchHelperOverAdb(context: Context) {
+        val task = synchronized(startLock) {
+            if (shell != null) return
+            startTask ?: newStart(context)
+        }
+        // 发现、ADB 和 Binder 交接均在锁外，acceptBinder 可以正常完成交接。
+        runStart(task)
+    }
+
+    /** 调用方持有 startLock；FutureTask 只执行一次，所有入口共享结果。 */
+    private fun newStart(context: Context): FutureTask<Unit> {
+        val appContext = context.applicationContext
+        return object : FutureTask<Unit>({ startHelperOverAdb(appContext) }) {
+            override fun done() {
+                synchronized(startLock) {
+                    if (startTask === this) startTask = null
+                }
+            }
+        }.also { startTask = it }
+    }
+
+    /** 执行或加入同一次启动，并保留原始错误类型。 */
+    private fun runStart(task: FutureTask<Unit>) {
+        task.run()
+        try {
+            task.get()
+        } catch (error: ExecutionException) {
+            throw error.cause ?: error
+        }
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun startHelperOverAdb(context: Context) {
         if (shell != null) return
         val prefs = ShellPrefs(context)
         val candidates = LinkedHashSet<Int>()
