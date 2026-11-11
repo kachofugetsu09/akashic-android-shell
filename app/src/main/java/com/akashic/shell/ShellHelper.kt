@@ -23,6 +23,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.Process
+import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
@@ -422,8 +423,8 @@ object HelperMain {
         val appUid = args[1].toIntOrNull() ?: exitProcess(2)
         Looper.prepareMainLooper()
         val service = AkashicShellService(appUid)
-        service.enableAppAccessibility(packageName)
         deliverBinder(packageName, appUid, service)
+        service.enableAppAccessibility(packageName)
         Log.i(TAG, "HelperMain entered Looper.loop() for $packageName ($appUid)")
         Looper.loop()
     }
@@ -459,6 +460,10 @@ object HelperMain {
             }
             val caller = AttributionSource.Builder(Process.myUid()).setPackageName(ShellContext.SHELL_PACKAGE).build()
             val res = call.invoke(provider, caller, authority, "attach", null, extras) as? Bundle
+            if (res?.containsKey("accepted") == true && !res.getBoolean("accepted")) {
+                Log.i(TAG, "Existing helper kept; duplicate handoff rejected")
+                exitProcess(0)
+            }
             val appToken = res?.getBinder("token") ?: run {
                 Log.e(TAG, "provider.call returned null or missing token: $res")
                 exitProcess(0)
@@ -499,6 +504,7 @@ class HelperHandoffProvider : ContentProvider() {
 }
 
 object ShellHelperHub {
+    private const val TAG = "AkashicShellHub"
     private val appToken = Binder()
     @Volatile var shell: IAkashicShell? = null
         private set
@@ -510,27 +516,56 @@ object ShellHelperHub {
     private val startLock = Any()
     private var startTask: FutureTask<Unit>? = null
 
+    /** 原子保留唯一活助手，拒绝的进程不获得 appToken。 */
     fun acceptBinder(binder: IBinder): Bundle {
         val iface = IAkashicShell.Stub.asInterface(binder)
-        runCatching {
-            binder.linkToDeath({
-                if (shell === iface) {
-                    shell = null
-                    statusText = "助手已断开"
+        val reply = Bundle().apply { putBoolean("accepted", false) }
+        var changed = false
+        synchronized(startLock) {
+            // 1. 活 owner 不被重复进程替换；只有确认死亡后才允许接替。
+            val current = shell
+            if (current != null && current.asBinder().isBinderAlive) return reply
+            if (current != null) {
+                shell = null
+                statusText = "助手已断开"
+                changed = true
+            }
+            val death = IBinder.DeathRecipient {
+                val cleared = synchronized(startLock) {
+                    if (shell !== iface) false else {
+                        shell = null
+                        statusText = "助手已断开"
+                        true
+                    }
+                }
+                if (cleared) {
                     ShellStatus.notifyChanged()
                     PhoneBridgeController.notifyStateChanged()
                 }
-            }, 0)
+            }
+            try {
+                binder.linkToDeath(death, 0)
+            } catch (error: RemoteException) {
+                Log.w(TAG, "Helper binder was already dead during handoff", error)
+                return@synchronized
+            }
+            if (!binder.isBinderAlive) {
+                Log.w(TAG, "Helper binder died during handoff")
+                return@synchronized
+            }
+            // 2. 与死亡清理共享短临界区，不让链接后的死亡回调错过本次发布。
+            shell = iface
+            statusText = "已激活 UID 2000 后台独立虚拟屏"
+            reply.putBoolean("accepted", true)
+            reply.putBinder("token", appToken)
+            handoffLatch?.countDown()
+            changed = true
         }
-        shell = iface
-        statusText = "已激活 UID 2000 后台独立虚拟屏"
-        handoffLatch?.countDown()
-        ShellStatus.notifyChanged()
-        PhoneBridgeController.notifyStateChanged()
-        return Bundle().apply {
-            putBoolean("accepted", true)
-            putBinder("token", appToken)
+        if (changed) {
+            ShellStatus.notifyChanged()
+            PhoneBridgeController.notifyStateChanged()
         }
+        return reply
     }
 
     /** 多次同步只预留一个后台启动任务。 */
