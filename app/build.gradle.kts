@@ -11,6 +11,7 @@ android {
         applicationId = "com.akashic.shell"
         minSdk = 30
         targetSdk = 36
+        testInstrumentationRunner = "com.akashic.shell.NotifyLifecycleProbe"
         versionCode = 11
         versionName = "0.3.5"
     }
