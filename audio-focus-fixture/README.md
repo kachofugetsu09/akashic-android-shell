@@ -74,3 +74,15 @@ B abandon 后 A 实际 GAIN；最后两包都有释放记录且 host 停止。
 任一 FAILED、异常、缺回调或未清理都原样报告，不能把命令退出0当作焦点测试通过。
 两个 VD 均应记录 device_id；普通 VD 常与默认设备共享音频域，以实际结果为准。
 这只能证明两个测试包的跨显示器焦点行为，不等同主屏真实播放器或 VirtualDevice 独立音频验收。
+
+## 有界真机结果
+
+Pixel 7 / Android16 在两个不同普通 VD 上执行，两个包实际都报告 device_id=0：
+A 的 GAIN 返回 GRANTED，B 的 TRANSIENT 返回 GRANTED，A 收到 LOSS_TRANSIENT；
+B abandon 返回成功后 A 收到 GAIN，两包最终均显式释放且服务停止，独立 audio focus stack 为空。
+这证明普通显示器没有隔离这两个包的音频焦点，而不是“产品音频隔离通过”。
+没有创建播放器或测真实主屏媒体，也没有改音量、AppOps 或用全局静音掩盖效果。
+
+首轮默认 listener 对象地址在两个冷进程中碰撞，系统生成相同 clientId，结果不适合判定隔离。
+修正为包名+请求 UUID 后重新执行得到上述回调链；首轮原始证据保留，没有把无回调当成通过。
+设备运行源 head 为 7958e898c6a8bc81457961c61a0014c0377e64bb；本节只补结果边界。
