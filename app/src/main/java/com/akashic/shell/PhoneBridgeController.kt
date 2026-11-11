@@ -101,6 +101,15 @@ object PhoneBridgeController {
     private var frameSeq = 0L
     private var encodedSeq = -1L
     private var encodedPng: ByteArray? = null
+    private var readerCreatedNanos = 0L
+    private var frameTimestampNanos = 0L
+    private var requiredFrameNanos = 0L
+    private var requiredScreenshotUptimeMs = 0L
+    private var frameClockError: String? = null
+
+    private data class FrameWatermark(
+        val reader: ImageReader, val previousNanos: Long, val previousUptimeMs: Long, val submittedNanos: Long,
+    )
     // 最近的端侧失败（回传失败等），随下一次 ack 报给服务端。
     private val recentErrors = ArrayDeque<String>()
     private val handledRequests = LinkedHashSet<String>()
@@ -662,7 +671,10 @@ object PhoneBridgeController {
         val message = when (action) {
             PhoneAction.LAUNCH_APP -> {
                 val pkg = payload.getString("package_name")
-                val code = checkNotNull(sh) { "后台助手未连接" }.startApp(dispId, pkg)
+                val target = checkNotNull(sh) { "后台助手未连接" }
+                val watermark = advanceFrameWatermark()
+                val code = target.startApp(dispId, pkg)
+                if (code == 2 || code == 4) restoreFrameWatermark(watermark)
                 if (code == 2) error("手机上未找到可启动的应用: $pkg")
                 if (code == 4) error("该应用无法证明可安全创建独立实例，请用户显式移交")
                 check(code == 0) { "后台虚拟屏启动 $pkg 失败 (code=$code)" }
@@ -684,6 +696,7 @@ object PhoneBridgeController {
                     x = payload.getInt("x")
                     y = payload.getInt("y")
                 }
+                advanceFrameWatermark()
                 check(sh != null && sh.injectTap(dispId, x, y)) { "后台点击未被接受，请重新观察屏幕" }
                 updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
                 "已在后台显示器点击 ($x, $y)"
@@ -696,7 +709,7 @@ object PhoneBridgeController {
                 }?.key ?: error("当前没有聚焦输入框，请观察并指定 node_id")
                 val target = nodeForAction(dispId, id)
                 check(target.isEditable) { "目标不是可编辑输入框" }
-                check(a11y != null && a11y.setNodeText(target, text)) {
+                check(a11y != null && run { advanceFrameWatermark(); a11y.setNodeText(target, text) }) {
                     "输入框拒绝 ACTION_SET_TEXT；未覆盖用户剪贴板，请使用应用支持的输入方式"
                 }
                 textChange = TextChange(target, text)
@@ -714,6 +727,7 @@ object PhoneBridgeController {
                     "left" -> listOf((dm.widthPixels * 0.8f).toInt(), h / 2, (dm.widthPixels * 0.2f).toInt(), h / 2)
                     else -> listOf((dm.widthPixels * 0.2f).toInt(), h / 2, (dm.widthPixels * 0.8f).toInt(), h / 2)
                 }
+                advanceFrameWatermark()
                 check(sh != null && sh.injectSwipe(dispId, x1, y1, x2, y2, 320)) { "后台滚动未被接受" }
                 updatePip(PipMode.RUNNING, "滚动 ($dir)", null)
                 "已执行滚动 ($dir)"
@@ -724,16 +738,19 @@ object PhoneBridgeController {
                 val x2 = payload.getInt("end_x")
                 val y2 = payload.getInt("end_y")
                 val dur = payload.optInt("duration_ms", 300)
+                advanceFrameWatermark()
                 check(sh != null && sh.injectSwipe(dispId, x1, y1, x2, y2, dur)) { "后台滑动未被接受" }
                 "已滑动 ($x1,$y1)->($x2,$y2)"
             }
             PhoneAction.BACK -> {
+                advanceFrameWatermark()
                 check(sh != null && sh.injectKey(dispId, KeyEvent.KEYCODE_BACK)) { "后台返回键未被接受" }
                 "已执行返回键"
             }
             PhoneAction.PRESS_KEY -> {
                 val key = payload.getString("key_code")
                 val code = appKeyCode(key)
+                advanceFrameWatermark()
                 check(sh != null && sh.injectKey(dispId, code)) { "后台按键未被接受" }
                 "已向后台应用发送按键 $key"
             }
@@ -767,6 +784,7 @@ object PhoneBridgeController {
             PhoneAction.RESUME_FROM_USER -> {
                 val pkg = takeoverPackage ?: activePackages.lastOrNull()
                 if (pkg != null && sh != null && backgroundDisplay) {
+                    advanceFrameWatermark()
                     runCatching { sh.moveTaskToDisplay(pkg, dispId) }
                 }
                 takeoverReason = null
@@ -826,7 +844,10 @@ object PhoneBridgeController {
     }
 
     private fun checkIntentStarted(shell: IAkashicShell?, displayId: Int, intent: Intent) {
-        val code = checkNotNull(shell) { "后台助手未连接" }.startIntent(displayId, intent)
+        val target = checkNotNull(shell) { "后台助手未连接" }
+        val watermark = advanceFrameWatermark()
+        val code = target.startIntent(displayId, intent)
+        if (code == 2 || code == 4) restoreFrameWatermark(watermark)
         check(code != 4) { "目标主屏任务无法安全创建独立实例，请用户显式移交" }
         check(code == 0) { "后台目标无法启动 (code=$code)" }
     }
@@ -889,6 +910,11 @@ object PhoneBridgeController {
     /** raw 和编码缓存只属于当前 reader，释放或换代时一起失效。 */
     private fun setFrameReader(reader: ImageReader?) = synchronized(frameLock) {
         imageReader = reader
+        readerCreatedNanos = if (reader != null) System.nanoTime() else 0L
+        frameTimestampNanos = 0L
+        requiredFrameNanos = 0L
+        requiredScreenshotUptimeMs = if (reader != null) SystemClock.uptimeMillis() else 0L
+        frameClockError = null
         frameBitmap?.recycle()
         frameBitmap = null
         frameSize = 0 to 0
@@ -896,10 +922,37 @@ object PhoneBridgeController {
         encodedSeq = -1L
         encodedPng = null
         latestPreviewPng = null
+        (frameLock as Object).notifyAll()
+    }
+
+    /** 水位在外部调用前建立，执行期间生产的有效帧仍可使用；未知失败不能撤销水位。 */
+    private fun advanceFrameWatermark(): FrameWatermark = synchronized(frameLock) {
+        val reader = checkNotNull(imageReader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
+        val submitted = System.nanoTime()
+        val previous = FrameWatermark(reader, requiredFrameNanos, requiredScreenshotUptimeMs, submitted)
+        requiredFrameNanos = submitted
+        requiredScreenshotUptimeMs = SystemClock.uptimeMillis()
+        previous
+    }
+
+    private fun restoreFrameWatermark(previous: FrameWatermark) = synchronized(frameLock) {
+        if (imageReader === previous.reader && requiredFrameNanos == previous.submittedNanos) {
+            requiredFrameNanos = previous.previousNanos
+            requiredScreenshotUptimeMs = previous.previousUptimeMs
+        }
     }
 
     private fun copyFrame(reader: ImageReader, image: Image, width: Int, height: Int): Boolean = synchronized(frameLock) {
         if (imageReader !== reader) return false
+        val timestamp = image.timestamp
+        val now = System.nanoTime()
+        if (timestamp < readerCreatedNanos || timestamp > now || timestamp < frameTimestampNanos) {
+            frameClockError = "PHONE_FRAME_CLOCK: producer=$timestamp created=$readerCreatedNanos previous=$frameTimestampNanos now=$now"
+            (frameLock as Object).notifyAll()
+            error(frameClockError!!)
+        }
+        // 晚消费的旧队列帧不是新生产帧，不能因复制发生在动作之后而放行。
+        if (timestamp <= requiredFrameNanos) return false
         val plane = image.planes[0]
         val strideWidth = plane.rowStride / plane.pixelStride
         val buf = frameBitmap?.takeIf { it.width == strideWidth && it.height == height }
@@ -910,17 +963,18 @@ object PhoneBridgeController {
         buf.copyPixelsFromBuffer(plane.buffer.rewind())
         frameSize = width to height
         frameSeq++
+        frameTimestampNanos = timestamp
+        frameClockError = null
+        (frameLock as Object).notifyAll()
         true
-    }
-
-    private fun hasFrame(reader: ImageReader): Boolean = synchronized(frameLock) {
-        imageReader === reader && frameBitmap != null
     }
 
     // 按需把最新一帧编码成整屏 PNG；同一帧只编码一次。
     private fun encodeFullPng(reader: ImageReader): ByteArray? {
         synchronized(frameLock) {
             if (imageReader !== reader) return null
+            frameClockError?.let { error(it) }
+            if (frameTimestampNanos <= requiredFrameNanos) return null
             val src = frameBitmap ?: return null
             if (encodedSeq == frameSeq) return encodedPng
             val (w, h) = frameSize
@@ -963,6 +1017,52 @@ object PhoneBridgeController {
         if (pipMode != PipMode.HIDDEN) pipListener?.invoke(pipMode, pipLabel, preview.second)
     }
 
+    private fun waitForFramePng(reader: ImageReader, deadlineUptimeMs: Long): ByteArray? {
+        synchronized(frameLock) {
+            var remaining = deadlineUptimeMs - SystemClock.uptimeMillis()
+            while (remaining > 0) {
+                check(imageReader === reader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
+                encodeFullPng(reader)?.let { return it }
+                (frameLock as Object).wait(remaining)
+                remaining = deadlineUptimeMs - SystemClock.uptimeMillis()
+            }
+            check(imageReader === reader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
+            return encodeFullPng(reader)
+        }
+    }
+
+    private fun acceptAccessibilityScreenshot(reader: ImageReader, screenshot: CapturedScreenshot): ByteArray? = synchronized(frameLock) {
+        check(imageReader === reader) { "PHONE_FRAME_OWNER_LOST: 无障碍截图期间 reader 已释放或替换" }
+        frameClockError?.let { error(it) }
+        check(screenshot.uptimeMs > 0 && screenshot.uptimeMs <= SystemClock.uptimeMillis()) {
+            "PHONE_SCREENSHOT_CLOCK: 无障碍截图不是有效 uptimeMillis 时间戳"
+        }
+        if (screenshot.uptimeMs > requiredScreenshotUptimeMs) return screenshot.png
+        recordError("PHONE_SCREENSHOT_STALE: capture=${screenshot.uptimeMs} required=$requiredScreenshotUptimeMs")
+        null
+    }
+
+    /** raw 和无障碍截图各自验证生产时间；成功的 fallback 不改变旧 raw 的有效性。 */
+    private fun captureDisplayPng(displayId: Int, accessibility: AkashicAccessibilityService?): ByteArray {
+        val reader = synchronized(frameLock) {
+            check(displayId > Display.DEFAULT_DISPLAY && displayId == virtualDisplayId && isTrustedVirtualDisplay) {
+                "PHONE_FRAME_OWNER_LOST: 没有 owned 后台截图目标，未读取主屏"
+            }
+            checkNotNull(imageReader) { "PHONE_FRAME_OWNER_LOST: 截图 reader 已释放" }
+        }
+        val deadline = SystemClock.uptimeMillis() + 5_000L
+        encodeFullPng(reader)?.let { return it }
+        val screenshot = try {
+            accessibility?.captureScreenshotPng(displayId)
+        } catch (error: RuntimeException) {
+            recordError("无障碍截图失败: ${error.message}")
+            null
+        }
+        if (screenshot != null) acceptAccessibilityScreenshot(reader, screenshot)?.let { return it }
+        return waitForFramePng(reader, deadline)
+            ?: error("PHONE_FRAME_NOT_FRESH: 5秒内未取得动作水位之后的生产帧；未返回旧图，请重新观察")
+    }
+
     private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): CapturedScreen {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
@@ -977,16 +1077,7 @@ object PhoneBridgeController {
             ?: readout?.activityName
             ?: "MainActivity"
 
-        // 实时捕获截图并同时刷新右下角画中画小窗（解决小窗黑屏与截图空白问题）
-        val pngBytes: ByteArray? = if (isTrustedVirtualDisplay && dispId > 0) {
-            val reader = synchronized(frameLock) { imageReader }
-            if (reader != null && !hasFrame(reader)) SystemClock.sleep(280L)
-            if (includeScreenshot && reader != null) encodeFullPng(reader) ?: a11y?.captureScreenshotPng(dispId) else null
-        } else {
-            // 非 reader 来源的单次截图不写入虚拟屏缓存，也不以旧图掩盖失败。
-            a11y?.captureScreenshotPng(Display.DEFAULT_DISPLAY)
-        }
-        val returnedPng = if (includeScreenshot) pngBytes else null
+        val returnedPng = if (includeScreenshot) captureDisplayPng(dispId, a11y) else null
 
         val screen = JSONObject()
             .put("display_id", dispId)

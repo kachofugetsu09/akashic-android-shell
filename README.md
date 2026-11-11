@@ -99,9 +99,21 @@ raw 帧、整屏 PNG 和预览都归属创建它们的 `ImageReader`。释放或
 `DONE` 小窗仅显式保留刚释放 reader 的最后预览，不供整屏截图或新 reader 复用。
 静态观察仍可复用同一有效 reader 的帧，不要求画面无变化时强制产生新帧。
 
-这只保证 reader 生命周期，尚不保证动作后的生产者新帧。不能把回调到达时间当作生产时间，
-也不能假定所有 `Image.timestamp` 与 `System.nanoTime()` 同钟。动作后帧的时间基准与屏障另需
-限定 owned SurfaceFlinger VD 来源并做真机校准；本改动没有以等待超时后返回旧图来假装满足该合同。
+可改变后台内容的调用在提交前推进 reader 的生产时间水位，包括不请求截图的动作。
+之后的 action/observe 截图都不能返回水位之前的 raw 帧，即使旧 Image 在动作后才复制；
+等待结束也不会撤销水位。纯 observe/WAIT 不推进水位，静态画面可复用同代有效帧。
+已知启动拒绝 code 2/4 在同 reader、同水位下恢复先前门槛；未知失败不恢复。
+真正的新帧或新捕获可恢复截图，释放后新 reader 重新建立有效域。
+
+此时钟合同仅限本程序创建的 owned SurfaceFlinger VD。Android 16 的 SF HWC/GPU、
+BufferQueue 与 ImageReader JNI 链传递 MONOTONIC 纳秒；reader 还要求生产时间落在其创建与
+当前 `nanoTime` 之间且不倒退。异常钟域明确失败，不用回调到达时间伪造生产时间，
+不向相机或任意 OEM producer 推广此保证。水位代表动作提交边界，不保证 UI 已完成或没有过渡帧。
+
+无障碍 fallback 保留 [`ScreenshotResult.timestamp`](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService.ScreenshotResult)
+的 `uptimeMillis` 单位，必须严格晚于当前水位且仍属于当前 reader；它不会把旧 raw 标为有效。
+没有 owned 后台截图目标时明确失败，不转读主屏。5 秒是取帧等待窗口，压缩和框架调用/调度
+仍可能增加端到端耗时，不能理解为硬返回期限。
 
 `probes/FrameOwnerProbe.java` 是独立 `app_process` 原生探针，通过候选 debug APK 的真实
 Controller 和 Android `ImageReader` / `ImageWriter` 校验缓存。它不安装 APK、不连接助手、
@@ -122,3 +134,16 @@ Shell 当前没有实现应用静音或显示器之间的音频焦点隔离，�
 
 输入返回成功前还会在原后台节点核对完整目标值。应用截断、忽略或未在等待内应用输入时，返回 `PHONE_INPUT_NOT_CONFIRMED`。
 该错误可能已有部分输入效果，不会自动重试；先重新观察实际值再决定下一步。
+
+`probes/FrameFreshnessProbe.java` 使用真实 ImageWriter 缓冲区和显式生产时间复现迟到旧 A，
+验证 raw/PNG 水位、两次实际 5 秒等待不放旧图、静态复用、已知失败恢复与异常钟域。
+其 CapturedScreenshot 是时间戳 guard 夹具，不是真实无障碍捕获；ImageWriter 也不是 SF 时钟校准。
+Pixel 上真实 owned VD 的时钟校准与完整动作/observe RPC 验收需另记录，不能从这些夹具外推。
+`probes/FrameClockProbe.java` 由唯一设备操作者在获准窗口以 UID2000 独立运行，复用真实
+AkashicShellService 创建新 VD，定向启动已安装的自有 `dev.akashic.phonelimit.ScrollActivity`
+并核对返回 code；仅 resize/释放自身 VD，记录 SF 生产时间与 mono 出生/消费时间。
+没有 SF 帧或钟域不符就失败，不改用 ImageWriter 代替真实来源。
+启动需传入本 attempt 尚不存在的 host gate 文件路径；只有 WMS task 和独立 provider
+都确认测试 Activity 在新 VD 后，host 才创建 gate。等待最多 30 秒，不能以 code 0 当成落屏。
+本轮 Pixel Android 16 的三个 SF 样本均在 nanoTime 有效域，消费年龄约 625ms、2.02ms、1.37ms；
+这只是单台设备的校准，不能外推其它 ROM。原空 VD 无帧及未等待落屏的 attempt 原证保留。
