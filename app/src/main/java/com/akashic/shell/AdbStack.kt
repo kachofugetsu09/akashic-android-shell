@@ -13,6 +13,7 @@ import java.io.Closeable
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.math.BigInteger
@@ -22,6 +23,11 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.security.GeneralSecurityException
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -40,6 +46,7 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.security.spec.RSAPublicKeySpec
 import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -232,43 +239,95 @@ class AdbIdentity(val keyPair: KeyPair, val name: String) {
         private const val WRAP_ALIAS = "akashic_adb_key_wrap"
         @Volatile private var cached: AdbIdentity? = null
 
+        fun forConnect(context: Context): AdbIdentity = get(context, repair = false)
+
+        fun forPairing(context: Context): AdbIdentity = get(context, repair = true)
+
         @Synchronized
-        fun get(context: Context): AdbIdentity {
+        private fun get(context: Context, repair: Boolean): AdbIdentity {
             cached?.let { return it }
             val file = File(context.applicationContext.noBackupFilesDir, "adb/adbkey.bin")
-            val name = "akashic@${Build.MODEL}"
-            if (file.isFile) {
-                runCatching {
-                    val b = file.readBytes()
-                    val ivLen = b[0].toInt() and 0xff
-                    val c = Cipher.getInstance("AES/GCM/NoPadding")
-                    c.init(Cipher.DECRYPT_MODE, wrappingKey(), GCMParameterSpec(128, b.copyOfRange(1, 1 + ivLen)))
-                    val pkcs8 = c.doFinal(b, 1 + ivLen, b.size - 1 - ivLen)
-                    val kf = KeyFactory.getInstance("RSA")
-                    val priv = kf.generatePrivate(PKCS8EncodedKeySpec(pkcs8)) as RSAPrivateKey
-                    val exp = (priv as? RSAPrivateCrtKey)?.publicExponent ?: RSAKeyGenParameterSpec.F4
-                    val pub = kf.generatePublic(RSAPublicKeySpec(priv.modulus, exp)) as RSAPublicKey
-                    return AdbIdentity(KeyPair(pub, priv), name).also { cached = it }
+            return load(file, "akashic@${Build.MODEL}", repair, ::wrappingKey).also { cached = it }
+        }
+
+        /** 加载持久身份；只有显式配对可以备份并替换损坏的密文。 */
+        internal fun load(
+            file: File,
+            name: String,
+            repair: Boolean,
+            wrappingKey: (create: Boolean) -> SecretKey,
+        ): AdbIdentity {
+            // 1. 连接失败必须保留原件，读取时也不能创建新的包装密钥。
+            if (file.exists()) {
+                if (!file.isFile) throw IOException("ADB identity path is not a regular file")
+                val failure = try {
+                    return read(file, name, wrappingKey)
+                } catch (e: IOException) {
+                    e
+                } catch (e: GeneralSecurityException) {
+                    e
                 }
+                if (!repair) throw IOException("Cannot read saved ADB identity; pair again to repair it", failure)
+                // 备份只保留密文字节，不能恢复已经丢失的 AndroidKeyStore 密钥。
+                val backup = File(file.parentFile, "${file.name}.before-pairing-${UUID.randomUUID()}.bak")
+                Files.copy(file.toPath(), backup.toPath())
+                FileOutputStream(backup, true).use { it.fd.sync() }
+                syncDirectory(backup.absoluteFile.parentFile!!)
             }
+
+            // 2. 保存成功后才允许调用方缓存或使用新身份。
             val g = KeyPairGenerator.getInstance("RSA")
             g.initialize(RSAKeyGenParameterSpec(2048, RSAKeyGenParameterSpec.F4))
             val id = AdbIdentity(g.generateKeyPair(), name)
-            runCatching {
-                val c = Cipher.getInstance("AES/GCM/NoPadding")
-                c.init(Cipher.ENCRYPT_MODE, wrappingKey())
-                val iv = c.iv
-                val out = byteArrayOf(iv.size.toByte()) + iv + c.doFinal(id.keyPair.private.encoded)
-                file.parentFile?.mkdirs()
-                file.writeBytes(out)
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.ENCRYPT_MODE, wrappingKey(true))
+            val iv = c.iv
+            val out = byteArrayOf(iv.size.toByte()) + iv + c.doFinal(id.keyPair.private.encoded)
+            val parent = file.absoluteFile.parentFile!!
+            Files.createDirectories(parent.toPath())
+            val temp = File.createTempFile("adbkey-", ".tmp", parent)
+            try {
+                FileOutputStream(temp).use { stream ->
+                    stream.write(out)
+                    stream.fd.sync()
+                }
+                Files.move(temp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                syncDirectory(parent)
+                // 首次创建 adb 目录时，也同步它在 noBackupFilesDir 中的目录项。
+                parent.parentFile?.let { syncDirectory(it) }
+            } finally {
+                temp.delete()
             }
-            cached = id
             return id
         }
 
-        private fun wrappingKey(): SecretKey {
+        private fun syncDirectory(directory: File) {
+            FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
+        }
+
+        /** 验证密文边界后解密并恢复原 RSA 公钥。 */
+        private fun read(file: File, name: String, wrappingKey: (Boolean) -> SecretKey): AdbIdentity {
+            val b = file.readBytes()
+            if (b.isEmpty()) throw IOException("Empty ADB identity file")
+            val ivLen = b[0].toInt() and 0xff
+            if (ivLen == 0 || b.size < 1 + ivLen + 16) throw IOException("Truncated ADB identity file")
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, wrappingKey(false), GCMParameterSpec(128, b.copyOfRange(1, 1 + ivLen)))
+            val pkcs8 = c.doFinal(b, 1 + ivLen, b.size - 1 - ivLen)
+            val kf = KeyFactory.getInstance("RSA")
+            val priv = kf.generatePrivate(PKCS8EncodedKeySpec(pkcs8)) as RSAPrivateKey
+            val exp = (priv as? RSAPrivateCrtKey)?.publicExponent ?: RSAKeyGenParameterSpec.F4
+            val pub = kf.generatePublic(RSAPublicKeySpec(priv.modulus, exp)) as RSAPublicKey
+            return AdbIdentity(KeyPair(pub, priv), name)
+        }
+
+        private fun wrappingKey(create: Boolean): SecretKey {
             val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-            (ks.getKey(WRAP_ALIAS, null) as? SecretKey)?.let { return it }
+            val existing = ks.getKey(WRAP_ALIAS, null)
+            if (existing != null) {
+                return existing as? SecretKey ?: throw GeneralSecurityException("Invalid ADB wrapping key type")
+            }
+            if (!create) throw GeneralSecurityException("Saved ADB wrapping key is missing")
             val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
             gen.init(
                 KeyGenParameterSpec.Builder(WRAP_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
@@ -424,7 +483,7 @@ object AdbWireless {
     }
 
     fun pair(context: Context, port: Int, code: String) {
-        val tls = AdbTls(AdbIdentity.get(context))
+        val tls = AdbTls(AdbIdentity.forPairing(context))
         tls.connect("127.0.0.1", port, 12_000).use { socket ->
             val exported = tls.exportKeyingMaterial(socket, "adb-label\u0000", 64)
             val spake = Spake2(
@@ -601,7 +660,7 @@ class AdbConnection private constructor(
 
     companion object {
         fun open(context: Context, port: Int, timeoutMs: Int = 8_000): AdbConnection {
-            val tls = AdbTls(AdbIdentity.get(context))
+            val tls = AdbTls(AdbIdentity.forConnect(context))
             val plain = Socket()
             plain.tcpNoDelay = true
             plain.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
