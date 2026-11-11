@@ -30,7 +30,8 @@ APK 位于 `audio-focus-fixture/build/outputs/apk/{a,b}/debug/`。
 Activity、Service 和只读 Provider 都要求 DUMP 权限，供 UID2000 测试操作。
 每包独立 SQLite 追加事件，含自增序号、wall_ms、elapsed_ms、实际 UID/PID、display_id、
 Context device_id、run_id、独立 request_id、事件、真实整数返回值及细节。
-回调携带原请求的 display/request 身份，不改写为最新值。Provider 不接受修改或清空。
+回调携带原请求的 display/request 身份，不改写为最新值。listener.toString() 固定包含包名和本次请求 UUID，
+避免两个冷进程的对象地址相同导致 AudioManager 的焦点 clientId 碰撞；request_begin 也记录此值。Provider 不接受修改或清空。
 SQLite 正常提交不等于掉电/强杀持久化验证。
 
 `request_result`：GRANTED=1、FAILED=0、DELAYED=2；本 fixture 不接受延迟焦点。

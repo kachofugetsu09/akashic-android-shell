@@ -60,15 +60,20 @@ public final class FocusService extends Service {
         startSilentHost();
         final String request = requestId, correlation = runId;
         final int originDisplay = displayId, originDevice = deviceId;
+        AudioManager.OnAudioFocusChangeListener listener = new AudioManager.OnAudioFocusChangeListener() {
+            @Override public void onAudioFocusChange(int change) {
+                events.add(FocusService.this, originDisplay, originDevice, correlation, request,
+                        "callback", change, "No player or automatic re-request");
+            }
+            @Override public String toString() { return getPackageName() + ":" + request; }
+        };
         focus = new AudioFocusRequest.Builder(gainCode)
                 .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
                 .setAcceptsDelayedFocusGain(false)
-                .setOnAudioFocusChangeListener(change -> events.add(this, originDisplay, originDevice,
-                        correlation, request, "callback", change, "No player or automatic re-request"),
-                        new Handler(Looper.getMainLooper()))
+                .setOnAudioFocusChangeListener(listener, new Handler(Looper.getMainLooper()))
                 .build();
-        events.add(this, displayId, deviceId, runId, requestId, "request_begin", gainCode, "No audio player");
+        events.add(this, displayId, deviceId, runId, requestId, "request_begin", gainCode, "listener=" + listener);
         try {
             int result = audio.requestAudioFocus(focus);
             events.add(this, displayId, deviceId, runId, requestId, "request_result", result, gain);
