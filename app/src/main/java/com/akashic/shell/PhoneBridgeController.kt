@@ -661,8 +661,9 @@ object PhoneBridgeController {
                     response.put("ok", true).put(
                         "result",
                         JSONObject()
-                            .put("kept", payload.optJSONArray("keep") ?: JSONArray())
-                            .put("closed", payload.optJSONArray("close") ?: JSONArray()),
+                            .put("kept", JSONArray())
+                            .put("closed", JSONArray())
+                            .put("message", "已结束整块后台显示器控制；不支持按包保留或关闭，不保证最近任务、进程或音频已停止"),
                     ).put("state", currentStateJson(context))
                 }
                 else -> error("未知端侧操作: $op")

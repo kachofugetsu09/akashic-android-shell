@@ -143,3 +143,9 @@ Probe 拒绝不带 `.resumetest` 后缀的目标；使用 Binder test double/故
 真实 Controller 检查旧助手、拒绝、回包丢失、重复点击、第三屏、消失和 effectLock，以及
 受控阻塞→释放显示器→迟到成功/异常不复活 PiP。没有创建/移动真实 task，不是真机迁移验收。
 失效代际只记录结果未知；不会把已停止的接管重新设为 NEEDS_YOU。
+
+## finish 的实际能力
+
+finish 保持整块 VD 的释放流程，不实现按包保留/关闭，不停止应用进程或音频，
+不保证最近任务消失。kept/closed 固定为空数组，不再把请求参数回显为已完成结果。
+为兼容旧在途请求，payload 即使携带 keep/close 也不会阻止整屏 release；不新增包级任务 API。
