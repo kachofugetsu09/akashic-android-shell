@@ -3,6 +3,7 @@ package com.akashic.shell
 import android.annotation.SuppressLint
 import android.app.ActivityOptions
 import android.app.Application
+import android.app.ApplicationExitInfo
 import android.app.Instrumentation
 import android.content.AttributionSource
 import android.content.ComponentName
@@ -21,6 +22,8 @@ import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.IInterface
+import android.os.Handler
 import android.os.Looper
 import android.os.Parcel
 import android.os.Process
@@ -37,6 +40,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import java.lang.reflect.InvocationTargetException
+import java.io.File
 import kotlin.system.exitProcess
 
 internal class ShellContext private constructor(base: Context) : ContextWrapper(base) {
@@ -461,67 +466,170 @@ internal class DisplayPower {
 
 object HelperMain {
     private const val TAG = "AkashicHelperMain"
+    private data class AppOwner(val token: IBinder, val pid: Int, val attachedAtMs: Long)
+    private lateinit var handler: Handler
+    private lateinit var service: AkashicShellService
+    private lateinit var packageName: String
+    private var appUid = -1
+    private lateinit var apkPath: String
+    private var appOwner: AppOwner? = null
+    private val restoreStarts = ArrayDeque<Long>()
 
     @JvmStatic
     fun main(args: Array<String>) {
         if (args.size < 2) exitProcess(2)
-        val packageName = args[0]
-        val appUid = args[1].toIntOrNull() ?: exitProcess(2)
+        packageName = args[0]
+        appUid = args[1].toIntOrNull() ?: exitProcess(2)
+        apkPath = File(checkNotNull(System.getProperty("java.class.path"))).canonicalPath
         Looper.prepareMainLooper()
-        val service = AkashicShellService(appUid)
-        deliverBinder(packageName, appUid, service)
-        service.enableAppAccessibility(packageName)
-        Log.i(TAG, "HelperMain entered Looper.loop() for $packageName ($appUid)")
+        handler = Handler(checkNotNull(Looper.myLooper()))
+        service = AkashicShellService(appUid)
+        handler.post { attach(null, false) }
         Looper.loop()
     }
 
+    /** 拒绝升级、换 UID、强停和禁用的包，不先启动 provider 再检查。 */
     @SuppressLint("PrivateApi")
-    private fun deliverBinder(packageName: String, appUid: Int, service: AkashicShellService) {
+    private fun checkPackage() {
+        val pm = ShellContext.create().packageManager
+        val info = pm.javaClass.getMethod(
+            "getApplicationInfoAsUser", String::class.java, Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+        ).invoke(pm, packageName, 0, appUid / 100_000) as ApplicationInfo
+        check(info.uid == appUid && info.enabled) { "App UID changed or package disabled" }
+        check(info.flags and ApplicationInfo.FLAG_STOPPED == 0) { "App was force-stopped" }
+        check(File(info.sourceDir).canonicalPath == apkPath) { "App APK changed; old helper stopped" }
+    }
+
+    /** UID 2000 按包读取系统退出记录，不从其他进程的退出原因推导许可。 */
+    @SuppressLint("PrivateApi")
+    private fun exitRecords(pid: Int, count: Int): List<ApplicationExitInfo> {
+        val am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null)!!
+        val slice = am.javaClass.getMethod(
+            "getHistoricalProcessExitReasons", String::class.java, Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+        ).invoke(am, packageName, pid, count, appUid / 100_000) ?: error("App exit history unavailable")
+        @Suppress("UNCHECKED_CAST")
+        return slice.javaClass.getMethod("getList").invoke(slice) as List<ApplicationExitInfo>
+    }
+
+    /** 只允许这个 App 进程已记录的异常退出；未知记录有限等待，不当作许可。 */
+    private fun exitReason(owner: AppOwner): Int? {
+        val info = exitRecords(owner.pid, 1).singleOrNull() ?: return null
+        if (info.pid != owner.pid || info.realUid != appUid || info.packageUid != appUid ||
+            info.timestamp < owner.attachedAtMs || info.timestamp > System.currentTimeMillis()) return null
+        val history = exitRecords(0, 0)
+        // 系统可能先重建主进程，再被用户 Stop；这个后代只作否决，绝不作许可。
+        check(history.none {
+            it.processName == packageName && it.realUid == appUid && it.packageUid == appUid &&
+                it.timestamp >= owner.attachedAtMs && it.reason in setOf(
+                    ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED,
+                )
+        }) { "User stopped the App or its replacement process" }
+        return info.reason.takeUnless { it == ApplicationExitInfo.REASON_UNKNOWN }
+    }
+
+    /** 一个 Looper 处理死亡和重交接，旧 token 的迟到通知不会清新资源。 */
+    private fun appDied(owner: AppOwner) {
+        if (appOwner !== owner) return
+        service.releaseAll()
+        Log.i(TAG, "App ${owner.pid} died; old displays released, checking recovery in 8s")
+        handler.postDelayed({ checkRecovery(owner, 0) }, 8_000L)
+    }
+
+    /** 退出记录可能异步入库，最多读取三次；拒绝用户 Stop 和未分类原因。 */
+    private fun checkRecovery(owner: AppOwner, poll: Int) {
+        if (appOwner !== owner) return
+        try {
+            checkPackage()
+            val reason = exitReason(owner)
+            if (reason == null && poll < 2) {
+                handler.postDelayed({ checkRecovery(owner, poll + 1) }, 1_000L)
+                return
+            }
+            check(reason in setOf(
+                ApplicationExitInfo.REASON_SIGNALED, ApplicationExitInfo.REASON_LOW_MEMORY,
+                ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE,
+                ApplicationExitInfo.REASON_ANR,
+            )) { "App ${owner.pid} exit reason $reason does not allow recovery" }
+            attach(owner, true)
+        } catch (error: ReflectiveOperationException) {
+            stopHelper("Cannot read App recovery state", error)
+        } catch (error: SecurityException) {
+            stopHelper("App recovery state denied", error)
+        } catch (error: IllegalStateException) {
+            stopHelper(error.message ?: "App recovery denied", error)
+        }
+    }
+
+    /** 回包可能丢失，只重交同一 Binder；不启动另一份 helper 或重放 RPC。 */
+    private fun attach(expected: AppOwner?, restoring: Boolean) {
+        if (appOwner !== expected) return
+        try {
+            checkPackage()
+            if (restoring) {
+                val now = SystemClock.elapsedRealtime()
+                while (restoreStarts.firstOrNull()?.let { now - it >= 600_000L } == true) restoreStarts.removeFirst()
+                check(restoreStarts.size < 3) { "App recovery limit reached (3 attempts / 10min)" }
+                restoreStarts.addLast(now)
+            }
+            val startedAtMs = System.currentTimeMillis()
+            val reply = deliverBinder(restoring)
+            check(reply.getBoolean("accepted")) { reply.getString("reason") ?: "Helper handoff rejected" }
+            val token = checkNotNull(reply.getBinder("token")) { "Accepted handoff has no App token" }
+            val pid = reply.getInt("app_pid")
+            check(pid > 0) { "Accepted handoff has no App PID" }
+            val owner = AppOwner(token, pid, startedAtMs)
+            appOwner = owner
+            try {
+                token.linkToDeath({ handler.post { appDied(owner) } }, 0)
+            } catch (_: RemoteException) {
+                appDied(owner)
+                return
+            }
+            if (!token.isBinderAlive) return // 已排队的 death callback 负责清理。
+            if (!restoring) service.enableAppAccessibility(packageName)
+            Log.i(TAG, "Helper attached to App $pid (restoring=$restoring)")
+            reply.getString("restore_error")?.let { Log.e(TAG, "Binder attached, service recovery failed: $it") }
+        } catch (error: InvocationTargetException) {
+            stopHelper("Helper handoff failed", error)
+        } catch (error: ReflectiveOperationException) {
+            stopHelper("Helper handoff API failed", error)
+        } catch (error: SecurityException) {
+            stopHelper("Helper handoff denied", error)
+        } catch (error: IllegalStateException) {
+            stopHelper(error.message ?: "Helper handoff rejected", error)
+        }
+    }
+
+    private fun stopHelper(message: String, error: Throwable) {
+        Log.e(TAG, message, error)
+        service.releaseAll()
+        exitProcess(1)
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun deliverBinder(restoring: Boolean): Bundle {
         val authority = "$packageName.helper"
         val userId = appUid / 100_000
         val am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null)!!
         val token = Binder()
-        val holder = try {
+        val holder =
             am.javaClass.getMethod(
                 "getContentProviderExternal", String::class.java, Int::class.javaPrimitiveType,
                 IBinder::class.java, String::class.java,
             ).invoke(am, authority, userId, token, "AkashicHelper")
-        } catch (t: Throwable) {
-            Log.e(TAG, "getContentProviderExternal failed", t)
-            null
-        } ?: exitProcess(1)
+                ?: error("Helper provider unavailable")
         try {
             val providerField = holder.javaClass.getDeclaredField("provider").apply { isAccessible = true }
-            val provider = providerField.get(holder) ?: run {
-                Log.e(TAG, "holder.provider is null")
-                exitProcess(1)
-            }
+            val provider = checkNotNull(providerField.get(holder)) { "holder.provider is null" }
             val extras = Bundle().apply {
                 putBinder("binder", service)
                 putInt("uid", Process.myUid())
                 putInt("pid", Process.myPid())
+                putString("apk_path", apkPath)
             }
-            val call = provider.javaClass.methods.first {
-                it.name == "call" && it.parameterTypes.size == 5 && it.parameterTypes[0] == AttributionSource::class.java
-            }
-            val caller = AttributionSource.Builder(Process.myUid()).setPackageName(ShellContext.SHELL_PACKAGE).build()
-            val res = call.invoke(provider, caller, authority, "attach", null, extras) as? Bundle
-            if (res?.containsKey("accepted") == true && !res.getBoolean("accepted")) {
-                Log.i(TAG, "Existing helper kept; duplicate handoff rejected")
-                exitProcess(0)
-            }
-            val appToken = res?.getBinder("token") ?: run {
-                Log.e(TAG, "provider.call returned null or missing token: $res")
-                exitProcess(0)
-            }
-            Log.i(TAG, "Successfully delivered IAkashicShell binder to $packageName")
-            appToken.linkToDeath({
-                runCatching { service.releaseAll() }
-                exitProcess(0)
-            }, 0)
-        } catch (t: Throwable) {
-            Log.e(TAG, "deliverBinder failed", t)
-            exitProcess(1)
+            return callProvider(provider, authority, if (restoring) "restore" else "attach", extras)
         } finally {
             runCatching {
                 am.javaClass.getMethod(
@@ -530,6 +638,27 @@ object HelperMain {
             }
         }
     }
+
+    /** 外部 handle 仍持有期间只重投同一个 provider；它死亡后绝不重新获取。 */
+    private fun callProvider(provider: Any, authority: String, method: String, extras: Bundle): Bundle {
+        val binder = (provider as IInterface).asBinder()
+        val call = provider.javaClass.methods.first {
+            it.name == "call" && it.parameterTypes.size == 5 && it.parameterTypes[0] == AttributionSource::class.java
+        }
+        val caller = AttributionSource.Builder(Process.myUid()).setPackageName(ShellContext.SHELL_PACKAGE).build()
+        for (attempt in 0..2) {
+            check(binder.isBinderAlive) { "Handoff provider died; no new provider requested" }
+            try {
+                return call.invoke(provider, caller, authority, method, null, extras) as? Bundle
+                    ?: error("Helper handoff returned no reply")
+            } catch (error: InvocationTargetException) {
+                if (error.cause !is RemoteException || !binder.isBinderAlive || attempt == 2) throw error
+                Log.w(TAG, "Handoff reply unknown; retrying the same provider Binder", error.cause)
+                SystemClock.sleep(if (attempt == 0) 1_000L else 3_000L)
+            }
+        }
+        error("Handoff retry loop did not return")
+    }
 }
 
 class HelperHandoffProvider : ContentProvider() {
@@ -537,9 +666,31 @@ class HelperHandoffProvider : ContentProvider() {
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         val callerUid = Binder.getCallingUid()
-        if (method != "attach" || (callerUid != 2000 && callerUid != 0)) return null
+        if (method !in setOf("attach", "restore") || (callerUid != 2000 && callerUid != 0)) return null
         val binder = extras?.getBinder("binder") ?: return null
-        return ShellHelperHub.acceptBinder(binder)
+        val context = checkNotNull(context)
+        fun reject(reason: String) = Bundle().apply { putBoolean("accepted", false); putString("reason", reason) }
+        if (extras.getString("apk_path") != File(context.applicationInfo.sourceDir).canonicalPath) return reject("App APK changed")
+        if (method == "restore") {
+            val prefs = ShellPrefs(context)
+            if (!prefs.phoneUseEnabled || prefs.serverUrl == null) return reject("Phone use is disabled")
+        }
+        val reply = ShellHelperHub.acceptBinder(binder)
+        if (reply.getBoolean("accepted")) {
+            reply.putInt("app_pid", Process.myPid())
+            if (method == "restore") {
+                try {
+                    NotifyService.sync(context)
+                } catch (error: IllegalStateException) {
+                    Log.e("AkashicShellHub", "Binder accepted but foreground service could not start", error)
+                    reply.putString("restore_error", error.message ?: error.javaClass.simpleName)
+                } catch (error: SecurityException) {
+                    Log.e("AkashicShellHub", "Binder accepted but foreground service denied", error)
+                    reply.putString("restore_error", error.message ?: error.javaClass.simpleName)
+                }
+            }
+        }
+        return reply
     }
 
     override fun query(u: Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): Cursor? = null
@@ -570,6 +721,9 @@ object ShellHelperHub {
         synchronized(startLock) {
             // 1. 活 owner 不被重复进程替换；只有确认死亡后才允许接替。
             val current = shell
+            if (current != null && current.asBinder() == binder && binder.isBinderAlive) {
+                return Bundle().apply { putBoolean("accepted", true); putBinder("token", appToken) }
+            }
             if (current != null && current.asBinder().isBinderAlive) return reply
             if (current != null) {
                 shell = null
