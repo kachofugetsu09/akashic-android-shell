@@ -30,3 +30,16 @@ ANDROID_HOME=/path/to/android-sdk ./gradlew :app:assembleDebug
 默认调试包名为 `com.akashic.shell.debug`。测试机可使用
 `-PtestApplicationIdSuffix=` 构建同包名调试包；不同签名之间不能直接覆盖安装。
 安装或替换 APK 不等于后台控制、熄屏或网络重连已验收。
+
+## 手机连接协议（0.4.0）
+
+Shell 0.4.0 与 phone-use 0.2.0 必须配套升级。
+SSE hello 声明 `supports_connection_id: true`；服务端的首条 `welcome`
+返回 `device_id` 与不可为空的 `connection_id`。
+每条请求和异步状态上报固定使用产生它的连接标识，重连后不能借用新连接标识回传旧结果。
+服务端拒绝旧标识时，端侧不改写标识重发；旧结果不会变成新连接的成功结果。
+ACK 未被服务端接受时不开始操作。已经开始的外部效果仍可能完成，连接失效不等于回滚。
+
+旧服务端没有合法 welcome 时端侧会断开，并在设置中显示升级说明；不静默兼容。
+APK 的 release 构建变体仍遵循本仓库已有的本机 debug 签名演示约定。
+本机构建和验收不等于 GitHub release 或线上部署，换签名可能需要卸载重装。

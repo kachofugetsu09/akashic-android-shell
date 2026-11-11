@@ -200,6 +200,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         .put("connectionLabel", ShellStatus.connection.label)
         .put("phoneUseEnabled", prefs.phoneUseEnabled)
         .put("phoneConnected", PhoneBridgeController.connected)
+        .put("phoneConnectionError", PhoneBridgeController.connectionError ?: "")
         .put("accessibilityEnabled", AkashicAccessibilityService.instance != null)
         .put("adbHelperActive", ShellHelperHub.shell != null)
         .put("adbHelperStatus", ShellHelperHub.statusText)

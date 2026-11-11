@@ -44,7 +44,11 @@ object PhoneBridgeController {
     private const val PREVIEW_INTERVAL_MS = 500L
     private val BACKOFF_MS = longArrayOf(1_000, 2_000, 5_000, 10_000, 30_000)
 
-    @Volatile var connected: Boolean = false
+    private data class ConnectionOwner(val server: String, val connectionId: String)
+
+    @Volatile private var activeOwner: ConnectionOwner? = null
+    val connected: Boolean get() = activeOwner != null
+    @Volatile var connectionError: String? = null
         private set
     @Volatile var pipMode: PipMode = PipMode.HIDDEN
         private set
@@ -119,7 +123,7 @@ object PhoneBridgeController {
         activeConnection?.disconnect()
         synchronized(wake) { (wake as Object).notifyAll() }
         releaseVirtualDisplay()
-        connected = false
+        activeOwner = null
         updatePip(PipMode.HIDDEN, "已关闭", null)
         ShellStatus.notifyChanged()
     }
@@ -275,7 +279,6 @@ object PhoneBridgeController {
             val server = prefs.serverUrl
             if (server == null || !prefs.phoneUseEnabled) break
             val established = connectOnce(context, server)
-            connected = false
             ShellStatus.notifyChanged()
             if (!running) break
             val waitMs = if (established) {
@@ -301,6 +304,7 @@ object PhoneBridgeController {
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("shell_version", BuildInfo.VERSION)
             .put("supports_ack", true)
+            .put("supports_connection_id", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -325,12 +329,12 @@ object PhoneBridgeController {
 
     fun notifyStateChanged() {
         val ctx = latestAppContext ?: return
-        val server = ShellPrefs(ctx).serverUrl ?: return
+        val owner = activeOwner ?: return
         Thread({
             val frame = currentStateJson(ctx)
                 .put("type", "state")
                 .put("device_id", deviceId(ctx))
-            postReply(server, null, frame)
+            postReply(owner, null, frame)
         }, "AkashicPhoneStatePush").start()
     }
 
@@ -348,12 +352,15 @@ object PhoneBridgeController {
         CookieManager.getInstance().getCookie(server)?.let { conn.setRequestProperty("Cookie", it) }
         activeConnection = conn
         var established = false
+        var owner: ConnectionOwner? = null
         try {
             val helloBytes = buildHello(context).toString().toByteArray(Charsets.UTF_8)
             conn.outputStream.use { it.write(helloBytes) }
-            if (conn.responseCode != 200) return false
-            connected = true
-            ShellStatus.notifyChanged()
+            if (conn.responseCode != 200) {
+                connectionError = "服务端拒绝手机连接（HTTP ${conn.responseCode}），请确认 Shell 与插件版本匹配"
+                ShellStatus.notifyChanged()
+                return false
+            }
             var event = ""
             val data = StringBuilder()
             conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
@@ -362,8 +369,23 @@ object PhoneBridgeController {
                     when {
                         line.isEmpty() -> {
                             if (data.isNotEmpty()) {
-                                established = true
-                                handleSseEvent(context, server, event, data.toString())
+                                if (event == "welcome") {
+                                    check(owner == null) { "服务端重复发送 welcome，请升级手机控制插件" }
+                                    val welcome = JSONObject(data.toString())
+                                    val id = welcome.opt("connection_id")
+                                    check(id is String && id.isNotBlank() && id.length <= 128) {
+                                        "服务端未提供有效 connection_id，请升级手机控制插件至 0.2.0 或更新版本"
+                                    }
+                                    check(welcome.optString("device_id") == deviceId(context)) { "服务端 welcome 的设备身份不匹配" }
+                                    owner = ConnectionOwner(server, id)
+                                    activeOwner = owner
+                                    connectionError = null
+                                    established = true
+                                    ShellStatus.notifyChanged()
+                                } else {
+                                    val current = checkNotNull(owner) { "服务端没有先发送 welcome，请升级手机控制插件" }
+                                    handleSseEvent(context, current, event, data.toString())
+                                }
                             }
                             event = ""
                             data.setLength(0)
@@ -374,29 +396,37 @@ object PhoneBridgeController {
                 }
             }
         } catch (_: IOException) {
-        } catch (t: Throwable) {
-            Log.w(TAG, "phone stream error", t)
+        } catch (error: IllegalStateException) {
+            connectionError = error.message
+            recordError(error.message ?: "手机连接协议错误")
+        } catch (error: org.json.JSONException) {
+            connectionError = "服务端手机连接数据无效，请确认 Shell 与插件版本匹配"
+            recordError("phone stream JSON error: ${error.message}")
         } finally {
-            activeConnection = null
+            if (activeOwner === owner) activeOwner = null
+            if (activeConnection === conn) activeConnection = null
             conn.disconnect()
+            ShellStatus.notifyChanged()
         }
         return established
     }
 
-    private fun handleSseEvent(context: Context, server: String, event: String, rawData: String) {
-        if (event == "heartbeat" || event == "welcome") return
-        val json = runCatching { JSONObject(rawData) }.getOrNull() ?: return
+    private fun handleSseEvent(context: Context, owner: ConnectionOwner, event: String, rawData: String) {
+        if (event == "heartbeat") return
+        val json = JSONObject(rawData)
         if (json.optString("type") != "request") return
-        val requestId = json.optString("request_id")
-        val op = json.optString("op")
-        val payload = json.optJSONObject("payload") ?: JSONObject()
+        val requestId = json.getString("request_id")
+        check(requestId.isNotBlank() && requestId.length <= 128) { "服务端请求 ID 无效" }
+        val op = json.getString("op")
+        val payload = json.getJSONObject("payload")
         if (!markHandled(requestId)) return
-        val cookie = runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
-        Thread({ runRpc(context, server, cookie, requestId, op, payload) }, "AkashicPhoneRpc-$requestId").start()
+        val cookie = CookieManager.getInstance().getCookie(owner.server)
+        Thread({ runRpc(context, owner, cookie, requestId, op, payload) }, "AkashicPhoneRpc-$requestId").start()
     }
 
     // 熄屏时 CPU 随时可能挂起：从收到请求到结果送达全程持 partial wake lock。
-    private fun runRpc(context: Context, server: String, cookie: String?, requestId: String, op: String, payload: JSONObject) {
+    private fun runRpc(context: Context, owner: ConnectionOwner, cookie: String?, requestId: String, op: String, payload: JSONObject) {
+        if (activeOwner !== owner) return
         val lock = context.getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "akashic:phone-rpc")
             .apply { setReferenceCounted(false); acquire(RPC_WAKE_LOCK_MS) }
@@ -407,13 +437,13 @@ object PhoneBridgeController {
                 .put("device_id", deviceId(context))
                 .put("request_id", requestId)
                 .put("recent_errors", drainRecentErrors())
-            postReply(server, cookie, ack, attempts = 1)
+            if (!postReply(owner, cookie, ack, attempts = 1) || activeOwner !== owner) return
             // 2. 执行并回传结果，失败重试
             val started = SystemClock.uptimeMillis()
             val reply = executeRpc(context, requestId, op, payload)
             val bytes = reply.toString().toByteArray(Charsets.UTF_8)
             Log.i(TAG, "rpc $requestId $op executed in ${SystemClock.uptimeMillis() - started}ms, reply ${bytes.size / 1024}KB")
-            postReply(server, cookie, reply, attempts = REPLY_ATTEMPTS)
+            postReply(owner, cookie, reply, attempts = REPLY_ATTEMPTS)
         } finally {
             lock.release()
         }
@@ -438,19 +468,20 @@ object PhoneBridgeController {
         JSONArray(recentErrors.toList()).also { recentErrors.clear() }
     }
 
-    private fun postReply(server: String, cookie: String?, body: JSONObject, attempts: Int = 1): Boolean {
+    private fun postReply(owner: ConnectionOwner, cookie: String?, body: JSONObject, attempts: Int = 1): Boolean {
+        body.put("connection_id", owner.connectionId)
         val bytes = body.toString().toByteArray(Charsets.UTF_8)
         val kind = "${body.optString("type")} ${body.optString("request_id")}".trim()
         repeat(attempts) { attempt ->
             val started = SystemClock.uptimeMillis()
             try {
-                val conn = Server.open("$server/api/phone/reply", readTimeoutMs = REPLY_READ_TIMEOUT_MS)
+                val conn = Server.open("${owner.server}/api/phone/reply", readTimeoutMs = REPLY_READ_TIMEOUT_MS)
                 conn.requestMethod = "POST"
                 conn.doOutput = true
                 conn.setFixedLengthStreamingMode(bytes.size)
                 conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("Origin", server)
-                val resolvedCookie = cookie ?: runCatching { CookieManager.getInstance().getCookie(server) }.getOrNull()
+                conn.setRequestProperty("Origin", owner.server)
+                val resolvedCookie = cookie ?: CookieManager.getInstance().getCookie(owner.server)
                 resolvedCookie?.let { conn.setRequestProperty("Cookie", it) }
                 try {
                     conn.outputStream.use { it.write(bytes) }

@@ -296,6 +296,8 @@
       if (state.phoneConnected) {
         phoneDot += " live";
         phoneLabel = "已连接 (" + (state.deviceId || "android") + ") · 支持后台虚拟屏与右下角小窗";
+      } else if (state.phoneConnectionError) {
+        phoneLabel = state.phoneConnectionError;
       } else {
         phoneDot += " busy";
         phoneLabel = "正在连接 /api/phone/stream…";
