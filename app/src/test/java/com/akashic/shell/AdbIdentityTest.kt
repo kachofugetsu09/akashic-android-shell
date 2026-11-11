@@ -86,6 +86,22 @@ class AdbIdentityTest {
     }
 
     @Test
+    fun failedStatDoesNotTreatExistingKeyAsMissing() = inDirectory { dir ->
+        val parent = File(dir, "adb").apply { mkdir() }
+        val file = File(parent, "adbkey.bin").apply { writeBytes(byteArrayOf(12, 1, 2)) }
+        assertTrue(parent.setExecutable(false, false))
+        try {
+            assertThrows(IOException::class.java) {
+                AdbIdentity.load(file, "test", false) { error("failed stat must not create an identity") }
+            }
+        } finally {
+            assertTrue(parent.setExecutable(true, true))
+        }
+        assertArrayEquals(byteArrayOf(12, 1, 2), file.readBytes())
+        assertEquals(1, parent.list()!!.size)
+    }
+
+    @Test
     fun missingWrappingKeyDoesNotCreateOrReplaceAnythingOnConnect() = inDirectory { dir ->
         val file = File(dir, "adbkey.bin")
         val aes = key()

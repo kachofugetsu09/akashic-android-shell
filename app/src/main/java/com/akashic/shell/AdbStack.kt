@@ -25,8 +25,10 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.GeneralSecurityException
 import java.security.KeyFactory
 import java.security.KeyPair
@@ -258,8 +260,13 @@ class AdbIdentity(val keyPair: KeyPair, val name: String) {
             wrappingKey: (create: Boolean) -> SecretKey,
         ): AdbIdentity {
             // 1. 连接失败必须保留原件，读取时也不能创建新的包装密钥。
-            if (file.exists()) {
-                if (!file.isFile) throw IOException("ADB identity path is not a regular file")
+            val stored = try {
+                Files.readAttributes(file.toPath(), BasicFileAttributes::class.java)
+            } catch (_: NoSuchFileException) {
+                null
+            }
+            if (stored != null) {
+                if (!stored.isRegularFile) throw IOException("ADB identity path is not a regular file")
                 val failure = try {
                     return read(file, name, wrappingKey)
                 } catch (e: IOException) {
