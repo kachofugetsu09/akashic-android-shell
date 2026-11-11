@@ -122,7 +122,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         panel = createPanelWebView()
         panel.visibility = View.GONE
-        pipView = AgentPipView(this) { PhoneBridgeController.handleTakeoverTap(this) }
+        pipView = AgentPipView(this) { PhoneBridgeController.handleTakeoverTap() }
         root.addView(pipView, pipView.defaultLayoutParams())
         root.addView(panel, fill())
         setContentView(root)

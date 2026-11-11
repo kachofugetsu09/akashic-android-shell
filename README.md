@@ -154,3 +154,48 @@ AkashicShellService 创建新 VD，定向启动已安装的自有 `dev.akashic.p
 优先使用本次目标显示器的 top Activity；没有该结果时，包名只取本次该显示器的
 active/focused 应用窗口；候选包不唯一则未知，Activity 仍未知。不用最近启动包、其它显示器事件或
 Shell 自身的默认名称填充“当前前台”。请配套更新 phone-use 的空值展示；旧插件会补造默认包名。
+
+## 接管只移动明确记录的任务
+
+`hand_to_user` 只建立等待。用户真实点击 PiP 时，在与 RPC 共用的 effectLock 内，
+先从助手拥有的后台显示器查询 topTaskId，记下确切 ID，再向助手提交移交主屏请求。
+回包丢失或失败仍保留 ID 和接管原因；再次点击不重新选另一个任务。
+不再按包名从所有显示器挑任务，也不通过 launcher 创建替代实例。
+通知点击仍只打开 Shell；此改动不把通知点击改成自动移交。
+
+`resume_from_user` 没有已建立的接管等待时明确拒绝。尚未真实移交（没有记录 ID）时，
+只解除等待，不从主屏找应用。有 ID 时只请求它从主屏返回当前后台显示器；
+已在目标显示器可无操作成功，消失、第三屏、权限或调用失败均保留接管状态。
+成功文案表示恢复请求已接受，实际画面仍需核实，不声称物理迁移已独立验证。
+
+助手 identity 仍返回 int[]，在 UID/PID 后增加 protocolVersion=1。
+旧助手只有两个元素时明确提示重建；不调用旧 slot7 按包名移动方法。
+新 topTaskId / moveTaskById 使用未占用的事务13/14，slot7不复用。
+仓库内未发现其它 identity() 调用消费者；外部工具若依赖数组长度应同步更新。
+该任务 ID 是本次进程内接管状态，未新增跨进程持久恢复协议；系统查询与移动也不是原子比较交换。
+
+```text
+等待 ──真实点击──► 查 owned VD 的 taskId ──先记录──► 提交移交
+  │                                  │             │
+  └─未点击 resume：只清等待             └─失败/未知：保留 ID + reason
+                                                 │
+                      resume：只按该 ID 从主屏返回 ┘
+```
+
+验收由唯一设备 owner 排队：无等待 resume 拒绝；未点击的等待仅解除；
+同包不同显示器实例只移动记录的 owned ID；回包丢失后仍使用同 ID；
+任务消失/第三屏/旧助手拒绝且原因保留；成功后通过独立 WMS 核对同 taskId 的归属。
+不在非受控窗口移交主屏，不把构建通过当作真机通过。
+
+原生隔离 Binder 故障 probe（只有构建命令，不自动安装）：
+
+```sh
+ANDROID_HOME=/path/to/sdk ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest -PtestApplicationIdSuffix=.resumetest -PprobeRunner=com.akashic.shell.TaskTransferProbe
+```
+
+设备 owner 可只安装这两份专用 APK 后执行
+`am instrument -w com.akashic.shell.resumetest.test/com.akashic.shell.TaskTransferProbe`。
+Probe 拒绝不带 `.resumetest` 后缀的目标；使用 Binder test double/故障夹具、实际 Proxy/Parcel 和
+真实 Controller 检查旧助手、拒绝、回包丢失、重复点击、第三屏、消失和 effectLock，以及
+受控阻塞→释放显示器→迟到成功/异常不复活 PiP。没有创建/移动真实 task，不是真机迁移验收。
+失效代际只记录结果未知；不会把已停止的接管重新设为 NEEDS_YOU。
