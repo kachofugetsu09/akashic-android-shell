@@ -157,8 +157,8 @@ object PhoneBridgeController {
 
     private fun ensureVirtualDisplay(context: Context): Int {
         virtualDisplayId?.let { currentId ->
-            if (isTrustedVirtualDisplay || ShellHelperHub.shell == null) return currentId
-            // 如果之前还没配对，现在刚刚配对上了 UID 2000 助手，释放旧屏重建 Trusted 虚拟屏
+            if (isTrustedVirtualDisplay && ShellHelperHub.shell != null) return currentId
+            // 助手断开后，清理已失去 owner 的显示器引用。
             releaseVirtualDisplay()
         }
         synchronized(this) {
@@ -222,24 +222,21 @@ object PhoneBridgeController {
                 }
             }
 
-            // 2. 未配对无线调试时，不建无效的空虚拟屏，直接使用主屏 ID (0) 并通过 AccessibilityService.takeScreenshot 实时抓图供小窗显示
             reader.close()
             ht.quitSafely()
-            virtualDisplayId = Display.DEFAULT_DISPLAY
-            isTrustedVirtualDisplay = false
-            return Display.DEFAULT_DISPLAY
+            error("后台手机控制未就绪：请连接 UID 2000 助手并确认设备支持独立显示器；未接管主屏")
         }
     }
 
-    // 每次操作前给虚拟屏续保活租约；主屏熄灭期间它若已休眠且唤不醒，就释放重建一块新的。
+    // 电源状态未知或无法独立唤醒时保留任务并报错，不借主屏唤醒或重建掩盖失败。
     private fun ensureAwakeDisplay(context: Context): Int {
         val id = ensureVirtualDisplay(context)
         val sh = ShellHelperHub.shell
-        if (!isTrustedVirtualDisplay || id <= 0 || sh == null) return id
-        if (runCatching { sh.keepAwake(id) }.getOrDefault(true)) return id
-        Log.i(TAG, "virtual display #$id asleep and could not be woken, recreating")
-        releaseVirtualDisplay()
-        return ensureVirtualDisplay(context)
+        check(isTrustedVirtualDisplay && id > Display.DEFAULT_DISPLAY && sh != null) {
+            "后台显示器未就绪，未接管主屏"
+        }
+        check(sh.keepAwake(id)) { "后台显示器无法独立唤醒；已保留当前任务，未唤醒主屏" }
+        return id
     }
 
     private fun releaseVirtualDisplay() {
@@ -502,9 +499,9 @@ object PhoneBridgeController {
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
-                    val dispId = ensureAwakeDisplay(context)
-                    lap("awake")
                     val act = payload.optString("action")
+                    val dispId = if (act == "hand_to_user") virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
+                    lap("awake")
                     val msg = runAction(context, dispId, act, payload)
                     lap("action")
                     val settleMs = if (act == "launch_app") 1_100L else 480L
@@ -669,7 +666,11 @@ object PhoneBridgeController {
                 val key = payload.optString("key_code")
                 val code = if (key.equals("BACK", ignoreCase = true)) KeyEvent.KEYCODE_BACK
                 else if (key.equals("ENTER", ignoreCase = true)) KeyEvent.KEYCODE_ENTER
-                else key.toIntOrNull() ?: KeyEvent.KEYCODE_BACK
+                else key.toIntOrNull() ?: error("未知按键 $key，请使用 BACK、ENTER 或数字键码")
+                require(code in 1..KeyEvent.getMaxKeyCode()) { "无效按键码 $code" }
+                check(code !in setOf(KeyEvent.KEYCODE_POWER, KeyEvent.KEYCODE_SLEEP, KeyEvent.KEYCODE_WAKEUP, KeyEvent.KEYCODE_SOFT_SLEEP)) {
+                    "后台操作不支持设备电源键，主屏电源由用户控制"
+                }
                 if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
                     sh.injectKey(dispId, code)
                 } else if (code == KeyEvent.KEYCODE_BACK) {

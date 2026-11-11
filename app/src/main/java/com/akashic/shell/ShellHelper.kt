@@ -119,41 +119,50 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     override fun createDisplay(surface: Surface, width: Int, height: Int, dpi: Int): Int {
         return try {
-            createVirtualDisplay(surface, width, height, dpi, trusted = true)
-        } catch (_: SecurityException) {
-            runCatching { createVirtualDisplay(surface, width, height, dpi, trusted = false) }.getOrDefault(-1)
+            createVirtualDisplay(surface, width, height, dpi)
         } catch (t: Throwable) {
             Log.e(TAG, "createDisplay failed", t)
             -1
         }
     }
 
-    private fun createVirtualDisplay(surface: Surface, width: Int, height: Int, dpi: Int, trusted: Boolean): Int {
+    private fun createVirtualDisplay(surface: Surface, width: Int, height: Int, dpi: Int): Int {
         var flags = (1 shl 0) or (1 shl 3) or (1 shl 6) or (1 shl 7) or (1 shl 8)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             flags = flags or (1 shl 13)
-            if (trusted) flags = flags or (1 shl 10) or (1 shl 11) or (1 shl 12)
+            flags = flags or (1 shl 10) or (1 shl 11) or (1 shl 12)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && trusted) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // OWN_FOCUS (1<<14) + STEAL_TOP_FOCUS_DISABLED (1<<16)：独立焦点且绝不抢主屏焦点
             flags = flags or (1 shl 14) or (1 shl 16)
         }
         val vd = displayManager.createVirtualDisplay("akashic-agent", width, height, dpi, surface, flags)
         val id = vd.display.displayId
+        try {
+            check(id > Display.DEFAULT_DISPLAY && vd.display.flags and REQUIRED_DISPLAY_FLAGS == REQUIRED_DISPLAY_FLAGS) {
+                "后台显示器缺少实际生效的隔离标志 (flags=${vd.display.flags})"
+            }
+            setFullscreenAndImePolicy(id)
+        } catch (error: Exception) {
+            vd.release()
+            throw error
+        }
         synchronized(displays) { displays[id] = vd }
         renewLease(id)
-        setFullscreenAndImePolicy(id)
         return id
     }
 
     // 虚拟屏带 OWN_DISPLAY_GROUP，有独立电源组：主屏熄灭后它会按无操作超时单独休眠，之后只出黑帧。
-    // 每次端侧操作续一次租约，租约内每 4 秒上报一次该屏的用户活动；已经睡着就往该屏注入 WAKEUP 唤醒。
+    // 每次端侧操作续一次租约；恢复时只唤醒独立电源组，WAKEUP 按键会被系统路由到主屏。
     override fun keepAwake(displayId: Int): Boolean {
         if (synchronized(displays) { displayId !in displays }) return false
+        val display = displayManager.getDisplay(displayId) ?: return false
+        // Display.FLAG_OWN_DISPLAY_GROUP 是实际生效的标志，不是创建时请求的标志。
+        if (displayId <= Display.DEFAULT_DISPLAY || display.flags and (1 shl 8) == 0) return false
         renewLease(displayId)
         power.userActivity(displayId)
         if (power.isInteractive(displayId)) return true
-        injectKey(displayId, KeyEvent.KEYCODE_WAKEUP)
+        power.wakeUp(displayId)
         repeat(10) {
             SystemClock.sleep(100L)
             if (power.isInteractive(displayId)) return true
@@ -173,16 +182,20 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
                 awakeLeases.entries.removeAll { it.value <= now }
                 awakeLeases.keys.toList()
             }
-            live.forEach { power.userActivity(it) }
+            live.forEach { id ->
+                runCatching { power.userActivity(id) }
+                    .onFailure { Log.w(TAG, "userActivity($id) failed", it) }
+            }
         }
     }
 
     @SuppressLint("PrivateApi")
     private fun setFullscreenAndImePolicy(displayId: Int) {
-        runCatching {
-            val wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null)!!
-            runCatching { wm.javaClass.getMethod("setWindowingMode", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 1) }
-            runCatching { wm.javaClass.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 0) }
+        val wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null)!!
+        runCatching { wm.javaClass.getMethod("setWindowingMode", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 1) }
+        wm.javaClass.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 0)
+        check(wm.javaClass.getMethod("getDisplayImePolicy", Int::class.javaPrimitiveType).invoke(wm, displayId) == 0) {
+            "后台显示器没有使用本地输入法，已拒绝创建"
         }
     }
 
@@ -349,6 +362,8 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     companion object {
         private const val TAG = "AkashicShellService"
+        // Display 的 TRUSTED、OWN_DISPLAY_GROUP、ALWAYS_UNLOCKED、OWN_FOCUS、STEAL_TOP_FOCUS_DISABLED。
+        private const val REQUIRED_DISPLAY_FLAGS = (1 shl 7) or (1 shl 8) or (1 shl 9) or (1 shl 11) or (1 shl 12)
         private const val KEEP_AWAKE_INTERVAL_MS = 4_000L
         private const val KEEP_AWAKE_LEASE_MS = 5 * 60_000L
     }
@@ -372,14 +387,27 @@ internal class DisplayPower {
         service!!.javaClass.getMethod("isDisplayInteractive", Int::class.javaPrimitiveType)
     }.getOrNull()
 
+    private val wakeMethod = runCatching {
+        service!!.javaClass.getMethod(
+            "wakeUpWithDisplayId", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+            String::class.java, String::class.java, Int::class.javaPrimitiveType,
+        )
+    }.getOrNull()
+
     fun userActivity(displayId: Int) {
-        runCatching { userActivityMethod?.invoke(service, displayId, SystemClock.uptimeMillis(), 0, 0) }
-            .onFailure { Log.w("AkashicShellService", "userActivity($displayId) failed", it) }
+        checkNotNull(userActivityMethod) { "设备不支持按显示器上报用户活动" }
+            .invoke(service, displayId, SystemClock.uptimeMillis(), 0, 0)
     }
 
-    // 查询失败时按“醒着”处理，避免误判后反复重建虚拟屏
     fun isInteractive(displayId: Int): Boolean =
-        runCatching { interactiveMethod?.invoke(service, displayId) as? Boolean }.getOrNull() ?: true
+        checkNotNull(interactiveMethod) { "设备不支持查询显示器电源状态" }
+            .invoke(service, displayId) as Boolean
+
+    fun wakeUp(displayId: Int) {
+        checkNotNull(wakeMethod) { "设备不支持独立唤醒后台显示器，未唤醒主屏" }
+            .invoke(service, SystemClock.uptimeMillis(), 2, "akashic:phone-display", ShellContext.SHELL_PACKAGE, displayId)
+    }
+
 }
 
 object HelperMain {
