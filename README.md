@@ -147,3 +147,10 @@ AkashicShellService 创建新 VD，定向启动已安装的自有 `dev.akashic.p
 都确认测试 Activity 在新 VD 后，host 才创建 gate。等待最多 30 秒，不能以 code 0 当成落屏。
 本轮 Pixel Android 16 的三个 SF 样本均在 nanoTime 有效域，消费年龄约 625ms、2.02ms、1.37ms；
 这只是单台设备的校准，不能外推其它 ROM。原空 VD 无帧及未等待落屏的 attempt 原证保留。
+
+## 当前应用身份
+
+屏幕的 `package_name` / `activity_name` 保持字符串，未知时为空串。
+优先使用本次目标显示器的 top Activity；没有该结果时，包名只取本次该显示器的
+active/focused 应用窗口；候选包不唯一则未知，Activity 仍未知。不用最近启动包、其它显示器事件或
+Shell 自身的默认名称填充“当前前台”。请配套更新 phone-use 的空值展示；旧插件会补造默认包名。

@@ -1070,12 +1070,9 @@ object PhoneBridgeController {
         val readout = a11y?.dumpScreen(dispId)
         val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
         val resolvedPkg = topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
-            ?: readout?.packageName
-            ?: activePackages.lastOrNull()
-            ?: "com.akashic.shell"
+            ?: readout?.packageName.orEmpty()
         val resolvedAct = topComp?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }
-            ?: readout?.activityName
-            ?: "MainActivity"
+            .orEmpty()
 
         val returnedPng = if (includeScreenshot) captureDisplayPng(dispId, a11y) else null
 
