@@ -73,3 +73,21 @@ APK 的 release 构建变体仍遵循本仓库已有的本机 debug 签名演示
 
 后台按键只支持应用文字和导航键；HOME、最近任务、音量、媒体、电源等全局系统控制由用户操作。
 未知动作、缺失参数和不支持的按键在创建显示器或输入前明确拒绝，不静默选择默认动作。
+
+## 节点快照协议（0.5.0，需 phone-use 0.3.0）
+
+每个最终 `screen` 携带产生它的 RPC UUID `snapshot_ref`，短 `node_id` 只在该快照内有效。
+节点点击、`type_text` 和 `clear_text` 必须原样传回引用；即使省略 `node_id` 使用聚焦输入框，
+文字操作也必须提供引用。缺少引用报告 `PHONE_SNAPSHOT_REF_REQUIRED`，不自动补最新值。
+
+新观察或动作结果替换引用与节点映射；连接更换、显示器释放或重建、空树、已开始的 RPC 失败清除节点引用。
+旧引用报告 `PHONE_SNAPSHOT_STALE`，在唤醒显示器、读取节点或输入前拒绝。
+仍会刷新节点并核对窗口的 displayId；此协议不保证页面在快照后不变，也不为坐标点击提供稳定性保证。
+Shell hello 声明 `supports_snapshot_ref=true`；新插件拒绝不支持的旧 Shell。
+
+```text
+RPC UUID ──► 最终 screen + 节点映射 ──► snapshot_ref + 短 node_id
+                                               │
+动作 ◄──────────────────────────────────────────┘
+  └─ effectLock 内先核对引用、连接与显示器代际，再读取节点
+```

@@ -84,7 +84,17 @@ object PhoneBridgeController {
     private var imageReader: ImageReader? = null
     private var localVirtualDisplay: VirtualDisplay? = null
     private val activePackages = LinkedHashSet<String>()
-    private var lastNodeRefs: Map<Int, AccessibilityNodeInfo> = emptyMap()
+    private data class NodeSnapshot(
+        val ref: String,
+        val owner: ConnectionOwner,
+        val displayId: Int,
+        val displayGeneration: Any,
+        val nodes: Map<Int, AccessibilityNodeInfo>,
+    )
+    private data class CapturedScreen(val json: JSONObject, val nodes: Map<Int, AccessibilityNodeInfo>)
+
+    @Volatile private var nodeSnapshot: NodeSnapshot? = null
+    @Volatile private var displayGeneration = Any()
     // 虚拟屏最新一帧（行宽含 stride 填充）；截图按需编码，不在每帧上编码整屏 PNG。
     private val frameLock = Any()
     private var frameBitmap: Bitmap? = null
@@ -264,7 +274,8 @@ object PhoneBridgeController {
             displayThread = null
             displayHandler = null
             activePackages.clear()
-            lastNodeRefs = emptyMap()
+            nodeSnapshot = null
+            displayGeneration = Any()
             takeoverReason = null
             takeoverPackage = null
             latestFullPng = null
@@ -311,6 +322,7 @@ object PhoneBridgeController {
             .put("shell_version", BuildInfo.VERSION)
             .put("supports_ack", true)
             .put("supports_connection_id", true)
+            .put("supports_snapshot_ref", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -391,6 +403,7 @@ object PhoneBridgeController {
                                     synchronized(this) {
                                         if (runToken !== token || activeConnection !== conn) return false
                                         owner = ConnectionOwner(server, id)
+                                        nodeSnapshot = null
                                         activeOwner = owner
                                         connectionError = null
                                     }
@@ -418,7 +431,10 @@ object PhoneBridgeController {
             recordError("phone stream JSON error: ${error.message}")
         } finally {
             synchronized(this) {
-                if (activeOwner === owner) activeOwner = null
+                if (activeOwner === owner) {
+                    nodeSnapshot = null
+                    activeOwner = null
+                }
                 if (activeConnection === conn) activeConnection = null
             }
             conn.disconnect()
@@ -553,24 +569,32 @@ object PhoneBridgeController {
                     lap("awake")
                     updatePip(if (takeoverReason != null) PipMode.NEEDS_YOU else PipMode.RUNNING, "正在观察屏幕", null)
                     val wantImg = payload.optBoolean("include_screenshot", false)
-                    val screen = buildScreenObject(context, dispId, wantImg)
+                    val generation = displayGeneration
+                    val captured = buildScreenObject(context, dispId, wantImg)
+                    val screen = publishScreen(owner, requestId, dispId, generation, captured)
                     lap("screen")
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
                     val act = readAction(payload)
+                    if (act == PhoneAction.TYPE_TEXT || act == PhoneAction.CLEAR_TEXT ||
+                        (act == PhoneAction.TAP && !payload.isNull("node_id") && payload.has("node_id"))) {
+                        checkNodeSnapshot(owner, payload)
+                    }
                     val dispId = if (act == PhoneAction.HAND_TO_USER) virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
                     lap("awake")
+                    val generation = displayGeneration
                     val msg = runAction(context, dispId, act, payload)
                     lap("action")
                     val settleMs = if (act == PhoneAction.LAUNCH_APP) 1_100L else 480L
                     SystemClock.sleep(settleMs)
                     val wantImg = payload.optBoolean("include_screenshot", false)
-                    var screen = buildScreenObject(context, dispId, wantImg)
-                    if (act == PhoneAction.LAUNCH_APP && (screen.optJSONArray("nodes")?.length() ?: 0) == 0) {
+                    var captured = buildScreenObject(context, dispId, wantImg)
+                    if (act == PhoneAction.LAUNCH_APP && (captured.json.optJSONArray("nodes")?.length() ?: 0) == 0) {
                         SystemClock.sleep(800L)
-                        screen = buildScreenObject(context, dispId, wantImg)
+                        captured = buildScreenObject(context, dispId, wantImg)
                     }
+                    val screen = publishScreen(owner, requestId, dispId, generation, captured)
                     lap("screen")
                     response.put("ok", true).put(
                         "result",
@@ -590,9 +614,10 @@ object PhoneBridgeController {
                             .put("closed", payload.optJSONArray("close") ?: JSONArray()),
                     ).put("state", currentStateJson(context))
                 }
-                else -> response.put("ok", false).put("error", "未知端侧操作: $op")
+                else -> error("未知端侧操作: $op")
             }
         } catch (t: Throwable) {
+            nodeSnapshot = null
             response.put("ok", false).put("error", t.message ?: t.javaClass.simpleName)
         } finally {
             effectLock.unlock()
@@ -640,7 +665,7 @@ object PhoneBridgeController {
             PhoneAction.TYPE_TEXT, PhoneAction.CLEAR_TEXT -> {
                 val text = if (action == PhoneAction.CLEAR_TEXT) "" else payload.getString("text")
                 val nodeId = payload.optInt("node_id", -1)
-                val id = if (nodeId > 0) nodeId else lastNodeRefs.entries.firstOrNull {
+                val id = if (nodeId > 0) nodeId else checkNotNull(nodeSnapshot).nodes.entries.firstOrNull {
                     it.value.isEditable && it.value.isFocused
                 }?.key ?: error("当前没有聚焦输入框，请观察并指定 node_id")
                 val target = nodeForAction(dispId, id)
@@ -728,9 +753,35 @@ object PhoneBridgeController {
         }
     }
 
+    /** 先核对快照身份，再读取短编号；缺失引用不会借用最新快照。 */
+    private fun checkNodeSnapshot(owner: ConnectionOwner, payload: JSONObject) {
+        val ref = payload.opt("snapshot_ref")
+        require(ref is String && ref.isNotBlank()) {
+            "PHONE_SNAPSHOT_REF_REQUIRED: 节点操作必须携带 snapshot_ref，请升级 phone-use 至 0.3.0 并重新观察"
+        }
+        val snapshot = nodeSnapshot
+        check(snapshot != null && snapshot.ref == ref && snapshot.owner === owner &&
+            snapshot.displayId == virtualDisplayId && snapshot.displayGeneration === displayGeneration) {
+            "PHONE_SNAPSHOT_STALE: 快照已过期，未执行节点操作，请重新观察"
+        }
+    }
+
+    /** 只发布本次 RPC 的最终树，引用和节点映射共用一个不可变槽位。 */
+    @Synchronized
+    private fun publishScreen(owner: ConnectionOwner, requestId: String, displayId: Int,
+                              generation: Any, captured: CapturedScreen): JSONObject {
+        check(activeOwner === owner && displayId == (virtualDisplayId ?: Display.INVALID_DISPLAY) && generation === displayGeneration) {
+            "PHONE_SNAPSHOT_STALE: 捕获期间连接或后台显示器已变化，请重新观察"
+        }
+        captured.json.put("snapshot_ref", requestId)
+        nodeSnapshot = if (displayId <= Display.DEFAULT_DISPLAY || captured.nodes.isEmpty()) null else
+            NodeSnapshot(requestId, owner, displayId, generation, captured.nodes)
+        return captured.json
+    }
+
     /** 节点必须仍可见且属于本次后台显示器，禁止用旧缓存操作用户主屏。 */
     private fun nodeForAction(displayId: Int, nodeId: Int): AccessibilityNodeInfo {
-        val node = lastNodeRefs[nodeId] ?: error("PHONE_NODE_STALE: 节点不存在，请重新观察")
+        val node = nodeSnapshot?.nodes?.get(nodeId) ?: error("PHONE_NODE_STALE: 节点不存在，请重新观察")
         check(node.refresh()) { "PHONE_NODE_STALE: 节点已失效，请重新观察" }
         check(node.window?.displayId == displayId && displayId > Display.DEFAULT_DISPLAY) {
             "PHONE_WRONG_DISPLAY: 节点已离开后台显示器，未执行操作"
@@ -831,12 +882,11 @@ object PhoneBridgeController {
         return out.toByteArray()
     }
 
-    private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): JSONObject {
+    private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): CapturedScreen {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
         val dm = context.resources.displayMetrics
         val readout = a11y?.dumpScreen(dispId)
-        lastNodeRefs = readout?.nodeRefs ?: emptyMap()
         val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
         val resolvedPkg = topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
             ?: readout?.packageName
@@ -861,7 +911,7 @@ object PhoneBridgeController {
         }
         val returnedPng = if (includeScreenshot) pngBytes else null
 
-        return JSONObject()
+        val screen = JSONObject()
             .put("display_id", dispId)
             .put("width", dm.widthPixels.takeIf { it > 0 } ?: 1080)
             .put("height", dm.heightPixels.takeIf { it > 0 } ?: 2400)
@@ -877,5 +927,6 @@ object PhoneBridgeController {
                     put("screenshot_b64", Base64.encodeToString(returnedPng, Base64.NO_WRAP))
                 }
             }
+        return CapturedScreen(screen, readout?.nodeRefs ?: emptyMap())
     }
 }
