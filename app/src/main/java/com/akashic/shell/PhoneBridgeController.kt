@@ -32,6 +32,7 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.util.concurrent.locks.ReentrantLock
 
 // 端侧后台控制桥：向 Akashic 服务端维持 /api/phone/stream 长连接，管理 UID 2000 特权 VirtualDisplay 与右下角画中画小窗。
 object PhoneBridgeController {
@@ -71,7 +72,8 @@ object PhoneBridgeController {
 
     @Volatile private var latestAppContext: Context? = null
     private var worker: Thread? = null
-    @Volatile private var running = false
+    @Volatile private var runToken: Any? = null
+    private val effectLock = ReentrantLock()
     @Volatile private var activeConnection: HttpURLConnection? = null
     private val wake = Any()
 
@@ -106,12 +108,13 @@ object PhoneBridgeController {
 
     @Synchronized
     fun start(appContext: Context) {
-        if (running && worker?.isAlive == true) {
+        if (runToken != null && worker?.isAlive == true) {
             synchronized(wake) { (wake as Object).notifyAll() }
             return
         }
-        running = true
-        worker = Thread({ loop(appContext) }, "AkashicPhoneBridge").apply {
+        val token = Any()
+        runToken = token
+        worker = Thread({ loop(appContext, token) }, "AkashicPhoneBridge").apply {
             isDaemon = true
             start()
         }
@@ -119,7 +122,7 @@ object PhoneBridgeController {
 
     @Synchronized
     fun stop() {
-        running = false
+        runToken = null
         activeConnection?.disconnect()
         synchronized(wake) { (wake as Object).notifyAll() }
         releaseVirtualDisplay()
@@ -272,15 +275,15 @@ object PhoneBridgeController {
         }
     }
 
-    private fun loop(context: Context) {
+    private fun loop(context: Context, token: Any) {
         val prefs = ShellPrefs(context)
         var attempts = 0
-        while (running) {
+        while (runToken === token) {
             val server = prefs.serverUrl
             if (server == null || !prefs.phoneUseEnabled) break
-            val established = connectOnce(context, server)
+            val established = connectOnce(context, server, token)
             ShellStatus.notifyChanged()
-            if (!running) break
+            if (runToken !== token) break
             val waitMs = if (established) {
                 attempts = 0
                 1_000L
@@ -290,7 +293,7 @@ object PhoneBridgeController {
                 ms
             }
             synchronized(wake) {
-                if (running) (wake as Object).wait(waitMs)
+                if (runToken === token) (wake as Object).wait(waitMs)
             }
         }
     }
@@ -338,7 +341,7 @@ object PhoneBridgeController {
         }, "AkashicPhoneStatePush").start()
     }
 
-    private fun connectOnce(context: Context, server: String): Boolean {
+    private fun connectOnce(context: Context, server: String, token: Any): Boolean {
         val conn = try {
             Server.open("$server/api/phone/stream", readTimeoutMs = READ_TIMEOUT_MS)
         } catch (_: IOException) {
@@ -350,21 +353,26 @@ object PhoneBridgeController {
         conn.setRequestProperty("Accept", "text/event-stream")
         conn.setRequestProperty("Origin", server)
         CookieManager.getInstance().getCookie(server)?.let { conn.setRequestProperty("Cookie", it) }
-        activeConnection = conn
+        synchronized(this) {
+            if (runToken !== token) {
+                conn.disconnect()
+                return false
+            }
+            activeConnection = conn
+        }
         var established = false
         var owner: ConnectionOwner? = null
         try {
             val helloBytes = buildHello(context).toString().toByteArray(Charsets.UTF_8)
             conn.outputStream.use { it.write(helloBytes) }
             if (conn.responseCode != 200) {
-                connectionError = "服务端拒绝手机连接（HTTP ${conn.responseCode}），请确认 Shell 与插件版本匹配"
-                ShellStatus.notifyChanged()
+                reportConnectionError(token, conn, "服务端拒绝手机连接（HTTP ${conn.responseCode}），请确认 Shell 与插件版本匹配")
                 return false
             }
             var event = ""
             val data = StringBuilder()
             conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-                while (running) {
+                while (runToken === token) {
                     val line = reader.readLine() ?: break
                     when {
                         line.isEmpty() -> {
@@ -377,9 +385,12 @@ object PhoneBridgeController {
                                         "服务端未提供有效 connection_id，请升级手机控制插件至 0.2.0 或更新版本"
                                     }
                                     check(welcome.optString("device_id") == deviceId(context)) { "服务端 welcome 的设备身份不匹配" }
-                                    owner = ConnectionOwner(server, id)
-                                    activeOwner = owner
-                                    connectionError = null
+                                    synchronized(this) {
+                                        if (runToken !== token || activeConnection !== conn) return false
+                                        owner = ConnectionOwner(server, id)
+                                        activeOwner = owner
+                                        connectionError = null
+                                    }
                                     established = true
                                     ShellStatus.notifyChanged()
                                 } else {
@@ -397,18 +408,28 @@ object PhoneBridgeController {
             }
         } catch (_: IOException) {
         } catch (error: IllegalStateException) {
-            connectionError = error.message
+            reportConnectionError(token, conn, error.message ?: "手机连接协议错误")
             recordError(error.message ?: "手机连接协议错误")
         } catch (error: org.json.JSONException) {
-            connectionError = "服务端手机连接数据无效，请确认 Shell 与插件版本匹配"
+            reportConnectionError(token, conn, "服务端手机连接数据无效，请确认 Shell 与插件版本匹配")
             recordError("phone stream JSON error: ${error.message}")
         } finally {
-            if (activeOwner === owner) activeOwner = null
-            if (activeConnection === conn) activeConnection = null
+            synchronized(this) {
+                if (activeOwner === owner) activeOwner = null
+                if (activeConnection === conn) activeConnection = null
+            }
             conn.disconnect()
             ShellStatus.notifyChanged()
         }
         return established
+    }
+
+    // 停止后的旧连接错误不能覆盖新 worker 的状态。
+    @Synchronized
+    private fun reportConnectionError(token: Any, connection: HttpURLConnection, message: String) {
+        if (runToken !== token || activeConnection !== connection) return
+        connectionError = message
+        ShellStatus.notifyChanged()
     }
 
     private fun handleSseEvent(context: Context, owner: ConnectionOwner, event: String, rawData: String) {
@@ -440,7 +461,7 @@ object PhoneBridgeController {
             if (!postReply(owner, cookie, ack, attempts = 1) || activeOwner !== owner) return
             // 2. 执行并回传结果，失败重试
             val started = SystemClock.uptimeMillis()
-            val reply = executeRpc(context, requestId, op, payload)
+            val reply = executeRpc(context, owner, requestId, op, payload)
             val bytes = reply.toString().toByteArray(Charsets.UTF_8)
             Log.i(TAG, "rpc $requestId $op executed in ${SystemClock.uptimeMillis() - started}ms, reply ${bytes.size / 1024}KB")
             postReply(owner, cookie, reply, attempts = REPLY_ATTEMPTS)
@@ -504,13 +525,16 @@ object PhoneBridgeController {
         return false
     }
 
-    private fun executeRpc(context: Context, requestId: String, op: String, payload: JSONObject): JSONObject {
+    private fun executeRpc(context: Context, owner: ConnectionOwner, requestId: String, op: String, payload: JSONObject): JSONObject {
         val devId = deviceId(context)
         val response = JSONObject()
             .put("type", "response")
             .put("device_id", devId)
             .put("request_id", requestId)
 
+        if (!effectLock.tryLock()) {
+            return response.put("ok", false).put("error", "PHONE_BUSY: 上一个手机操作仍在执行；本请求没有排队或执行，请稍后重新观察")
+        }
         val timing = JSONObject()
         var mark = SystemClock.uptimeMillis()
         fun lap(name: String) {
@@ -519,6 +543,7 @@ object PhoneBridgeController {
             mark = now
         }
         try {
+            check(activeOwner === owner) { "PHONE_STALE_CONNECTION: 请求所属连接已失效，未开始操作" }
             when (op) {
                 "observe" -> {
                     val dispId = ensureAwakeDisplay(context)
@@ -566,6 +591,8 @@ object PhoneBridgeController {
             }
         } catch (t: Throwable) {
             response.put("ok", false).put("error", t.message ?: t.javaClass.simpleName)
+        } finally {
+            effectLock.unlock()
         }
         val screen = response.optJSONObject("result")?.let { it.optJSONObject("screen") ?: it }
         screen?.optJSONArray("nodes")?.let { timing.put("nodes", it.length()) }
