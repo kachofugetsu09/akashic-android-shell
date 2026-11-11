@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.PowerManager
+import android.os.RemoteException
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Base64
@@ -59,8 +60,7 @@ object PhoneBridgeController {
         private set
     @Volatile var takeoverReason: String? = null
         private set
-    @Volatile var takeoverPackage: String? = null
-        private set
+    private var handedTaskId: Int? = null
     @Volatile var virtualDisplayId: Int? = null
         private set
     @Volatile var isTrustedVirtualDisplay: Boolean = false
@@ -151,19 +151,67 @@ object PhoneBridgeController {
         return if (aid.isNotEmpty()) "$modelSlug-$aid" else modelSlug.ifEmpty { "android-phone" }
     }
 
-    fun handleTakeoverTap(context: Context) {
-        val pkg = takeoverPackage ?: activePackages.lastOrNull()
-        if (pkg != null) {
-            val sh = ShellHelperHub.shell
-            if (sh != null) {
-                runCatching { sh.moveTaskToDisplay(pkg, Display.DEFAULT_DISPLAY) }
-            }
-            val launch = context.packageManager.getLaunchIntentForPackage(pkg)
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                runCatching { context.startActivity(launch) }
-            }
+    /** 用户真实点击后先记录任务身份，再发送移交；回包丢失也不丢 owner。 */
+    fun handleTakeoverTap() {
+        if (!effectLock.tryLock()) {
+            recordError("接管未开始：后台操作仍在执行，请稍后重试")
+            return
         }
+        val generation = displayGeneration
+        val displayId = virtualDisplayId
+        try {
+            if (takeoverReason == null) return
+            val source = checkNotNull(displayId) { "后台显示器已释放，未移交任务" }
+            check(isTrustedVirtualDisplay && source > Display.DEFAULT_DISPLAY) { "后台显示器身份已失效" }
+            val helper = taskTransferHelper()
+            val recordedId = synchronized(this) {
+                check(isCurrentTakeover(displayId, generation)) { "接管所属显示器已变化" }
+                handedTaskId
+            }
+            val id = recordedId ?: helper.topTaskId(source).also {
+                check(it >= 0) { "无法确定后台显示器的可移交任务，未操作主屏" }
+                synchronized(this) {
+                    check(isCurrentTakeover(displayId, generation)) { "接管所属显示器已变化" }
+                    handedTaskId = it
+                }
+            }
+            check(helper.moveTaskById(id, source, Display.DEFAULT_DISPLAY)) {
+                "任务移交结果未确认，可能已生效；任务身份和接管状态已保留，请先核实"
+            }
+            updateTakeoverPip(displayId, generation, "已提交移交请求，请检查主屏")
+        } catch (error: RemoteException) {
+            reportTakeoverFailure("移交结果未知，可能已生效；任务身份已保留，请核实：${error.message}", displayId, generation)
+        } catch (error: IllegalStateException) {
+            reportTakeoverFailure(error.message ?: error.javaClass.simpleName, displayId, generation)
+        } catch (error: SecurityException) {
+            reportTakeoverFailure(error.message ?: error.javaClass.simpleName, displayId, generation)
+        } finally {
+            effectLock.unlock()
+        }
+    }
+
+    private fun isCurrentTakeover(displayId: Int?, generation: Any): Boolean =
+        virtualDisplayId == displayId && displayGeneration === generation && takeoverReason != null
+
+    private fun reportTakeoverFailure(message: String, displayId: Int?, generation: Any) {
+        recordError("接管未确认：$message")
+        updateTakeoverPip(displayId, generation, "接管未确认，请稍后重试")
+    }
+
+    /** 与显示器释放共用现有 monitor，迟到的回包不能复活已结束的接管 UI。 */
+    private fun updateTakeoverPip(displayId: Int?, generation: Any, label: String) = synchronized(this) {
+        if (isCurrentTakeover(displayId, generation)) updatePip(PipMode.NEEDS_YOU, label, null)
+        else recordError("接管所属显示器已释放或变化，结果未知；未重新发布接管状态")
+    }
+
+    /** 旧助手只返回 UID/PID；不调用已退役的按包名移动事务。 */
+    private fun taskTransferHelper(): IAkashicShell {
+        val helper = checkNotNull(ShellHelperHub.shell) { "后台助手未连接，接管状态已保留" }
+        val identity = helper.identity()
+        check(identity.size >= 3 && identity[2] == IAkashicShell.TASK_TRANSFER_VERSION) {
+            "后台助手不支持确切任务移交，请重建助手后重试；未按包名移动任务"
+        }
+        return helper
     }
 
     private fun updatePip(mode: PipMode, label: String, png: ByteArray?) {
@@ -277,7 +325,7 @@ object PhoneBridgeController {
             nodeSnapshot = null
             displayGeneration = Any()
             takeoverReason = null
-            takeoverPackage = null
+            handedTaskId = null
             latestFullPng = null
             synchronized(frameLock) {
                 frameBitmap?.recycle()
@@ -577,6 +625,9 @@ object PhoneBridgeController {
                 }
                 "action" -> {
                     val act = readAction(payload)
+                    if (act == PhoneAction.RESUME_FROM_USER) {
+                        check(takeoverReason != null) { "当前没有用户接管等待，未移动任何任务" }
+                    }
                     if (act == PhoneAction.TYPE_TEXT || act == PhoneAction.CLEAR_TEXT ||
                         (act == PhoneAction.TAP && !payload.isNull("node_id") && payload.has("node_id"))) {
                         checkNodeSnapshot(owner, payload)
@@ -732,19 +783,30 @@ object PhoneBridgeController {
             PhoneAction.HAND_TO_USER -> {
                 val reason = payload.optString("reason", "需要您在手机主屏幕确认操作")
                 takeoverReason = reason
-                takeoverPackage = activePackages.lastOrNull()
                 updatePip(PipMode.NEEDS_YOU, "点此接管操作", null)
                 Notifications.showTakeover(context, reason)
                 "已挂起后台操作并通知用户点击右下角橙色呼吸小窗或通知接管 ($reason)"
             }
             PhoneAction.RESUME_FROM_USER -> {
-                val pkg = takeoverPackage ?: activePackages.lastOrNull()
-                if (pkg != null && sh != null && backgroundDisplay) {
-                    runCatching { sh.moveTaskToDisplay(pkg, dispId) }
+                val generation = displayGeneration
+                val id = synchronized(this) { handedTaskId }
+                if (id != null) {
+                    try {
+                        check(taskTransferHelper().moveTaskById(id, Display.DEFAULT_DISPLAY, dispId)) {
+                            "任务恢复结果未确认，可能已生效；任务身份和接管状态已保留，请先核实"
+                        }
+                    } catch (error: RemoteException) {
+                        throw IllegalStateException("任务恢复结果未知，可能已生效；任务身份和接管状态已保留，请先核实", error)
+                    }
                 }
-                takeoverReason = null
-                updatePip(PipMode.RUNNING, "后台恢复运行", null)
-                "已从用户主屏收回控制权继续后台虚拟屏执行"
+                synchronized(this) {
+                    check(isCurrentTakeover(dispId, generation)) { "恢复期间显示器已变化，结果未知" }
+                    handedTaskId = null
+                    takeoverReason = null
+                    updatePip(PipMode.RUNNING, "后台恢复请求已接受", null)
+                }
+                if (id == null) "已解除接管等待；尚未移交任务，未从主屏移动任何应用"
+                else "已接受任务 $id 返回后台显示器 (#$dispId) 的请求，请核对返回画面"
             }
             PhoneAction.WAIT -> {
                 SystemClock.sleep(payload.optLong("duration_ms", 1000L))

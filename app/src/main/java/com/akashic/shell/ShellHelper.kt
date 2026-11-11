@@ -116,7 +116,7 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         return super.onTransact(code, data, reply, flags)
     }
 
-    override fun identity(): IntArray = intArrayOf(Process.myUid(), Process.myPid())
+    override fun identity(): IntArray = intArrayOf(Process.myUid(), Process.myPid(), IAkashicShell.TASK_TRANSFER_VERSION)
 
     override fun createDisplay(surface: Surface, width: Int, height: Int, dpi: Int): Int {
         return try {
@@ -258,20 +258,45 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         return if (result in 0..99) 0 else 3
     }
 
-    override fun moveTaskToDisplay(packageName: String, targetDisplayId: Int): Boolean {
+    /** 只选择助手拥有的显示器上的当前任务，绝不从主屏按包名挑选。 */
+    override fun topTaskId(sourceDisplayId: Int): Int {
+        if (synchronized(displays) { sourceDisplayId !in displays }) return -1
         return try {
-            val tasks = allTasks()
+            val displayField = taskInfoClass.getField("displayId")
+            val topField = taskInfoClass.getField("topActivity")
+            val task = allTasks().firstOrNull {
+                displayField.getInt(it) == sourceDisplayId && topField.get(it) != null
+            } ?: return -1
+            taskInfoClass.getField("taskId").getInt(task)
+        } catch (error: ReflectiveOperationException) {
+            Log.e(TAG, "topTaskId failed", error)
+            -1
+        } catch (error: SecurityException) {
+            Log.e(TAG, "topTaskId denied", error)
+            -1
+        }
+    }
+
+    /** 只移动记录的确切任务；已在目标可重复确认，第三屏或消失则拒绝。 */
+    override fun moveTaskById(taskId: Int, expectedSourceDisplayId: Int, targetDisplayId: Int): Boolean {
+        val sourceOwned = synchronized(displays) { expectedSourceDisplayId in displays }
+        val targetOwned = synchronized(displays) { targetDisplayId in displays }
+        if (!((sourceOwned && targetDisplayId == Display.DEFAULT_DISPLAY) ||
+                    (expectedSourceDisplayId == Display.DEFAULT_DISPLAY && targetOwned))) return false
+        return try {
             val idField = taskInfoClass.getField("taskId")
-            val target = tasks.firstOrNull { t ->
-                listOf("topActivity", "baseActivity").any { field ->
-                    (runCatching { taskInfoClass.getField(field).get(t) }.getOrNull() as? ComponentName)?.packageName == packageName
-                }
-            } ?: return false
-            val taskId = idField.getInt(target)
+            val task = allTasks().firstOrNull { idField.getInt(it) == taskId } ?: return false
+            val currentDisplay = taskInfoClass.getField("displayId").getInt(task)
+            if (currentDisplay == targetDisplayId) return true
+            if (currentDisplay != expectedSourceDisplayId) return false
             taskManager.javaClass.getMethod("moveRootTaskToDisplay", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                 .invoke(taskManager, taskId, targetDisplayId)
             true
-        } catch (_: Throwable) {
+        } catch (error: ReflectiveOperationException) {
+            Log.e(TAG, "moveTaskById failed", error)
+            false
+        } catch (error: SecurityException) {
+            Log.e(TAG, "moveTaskById denied", error)
             false
         }
     }

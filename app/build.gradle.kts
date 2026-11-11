@@ -13,6 +13,7 @@ android {
         targetSdk = 36
         versionCode = 15
         versionName = "0.5.0"
+        testInstrumentationRunner = providers.gradleProperty("probeRunner").getOrElse("android.test.InstrumentationTestRunner")
     }
 
     buildFeatures {
