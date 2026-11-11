@@ -47,12 +47,14 @@ def main() -> None:
         local = request.client.host in ("127.0.0.1", "::1", args.bind)
         if request.client.host != args.peer and not local:
             return JSONResponse({"detail": "isolated test peer required"}, status_code=403)
+        if request.method == "GET" and request.url.path == "/api/shell/state":
+            return JSONResponse({"chatReady": False, "isolated": True, "service": "phone evaluation only"})
         authorized = request.headers.get("authorization") == "Bearer " + token
         if request.url.path.startswith("/control/") and not (local and authorized):
             return JSONResponse({"detail": "local bearer token required"}, status_code=403)
         if request.url.path == "/":
             response = HTMLResponse("<p>Isolated phone evaluation. No production workspace.</p>")
-            response.set_cookie("phone-eval", token, httponly=True, samesite="strict")
+            response.set_cookie("phone-eval", token, httponly=True, samesite="strict", max_age=86400)
             return response
         if request.cookies.get("phone-eval") != token and not (local and authorized):
             return JSONResponse({"detail": "open the isolated root page first"}, status_code=403)

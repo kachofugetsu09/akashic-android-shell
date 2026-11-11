@@ -31,7 +31,10 @@ PYTHONPATH="$CORE" "$CORE/.venv/bin/python" eval/serve.py \
 ```
 
 在测试 Shell 中使用 `http://LAN_HOST_IP:18769`，打开首页以取得隔离 cookie，
-再开启后台控制。服务不加载线上账户或生产 workspace。它只允许指定手机 IP，
+再开启后台控制。配置探测 `/api/shell/state` 返回 `chatReady:false`，只表示这是
+可连接的手机测试入口，不伪称已提供聊天服务；该元数据仍受 IP 范围限制。
+cookie 明确保留 24 小时，过期后需重新打开测试首页，不能把鉴权失败当成设备断网。
+服务不加载线上账户或生产 workspace。它只允许指定手机 IP，
 控制入口需要电脑本机 IP 和临时 token，WebSocket 被拒绝；不要公开这个测试服务。
 从 `/control/status` 读取 device_id，经 `/control/rpc` 用 `action/launch_app` 在
 虚拟屏启动 fixture。所有控制请求使用 `Authorization: Bearer <token>`。
