@@ -972,7 +972,7 @@ object PhoneBridgeController {
             .put("package_name", resolvedPkg)
             .put("activity_name", resolvedAct)
             .put("pip_state", pipMode.id)
-            .put("audio_muted", true)
+            .put("audio_muted", false)
             .put("nodes", readout?.nodes ?: JSONArray())
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
             .apply {

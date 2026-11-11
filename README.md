@@ -108,3 +108,9 @@ Controller 和 Android `ImageReader` / `ImageWriter` 校验缓存。它不安装
 不创建显示器或修改正在运行的 App 单例。baseline 模式只复现 release 遗留预览；candidate
 模式验证真实 RGBA→PNG、同帧复用、退役 reader 拒绝发布和 DONE 分离。它不替代真实 VD、
 动作后新帧或最终 release/R8 应用验收。
+
+## 音频状态
+
+Shell 当前没有实现应用静音或显示器之间的音频焦点隔离，因此 `screen.audio_muted` 返回 `false`。
+这不代表目标应用一定正在发声；它表示 Shell 没有建立静音保障。
+后台应用仍可能发声或影响用户正在播放的音频，独立虚拟显示器不能作为音频隔离的证明。
