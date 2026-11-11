@@ -694,7 +694,8 @@ object PhoneBridgeController {
                 }
                 // SET_TEXT 被接受不等于值已生效；只对同一后台窗口的精确读回免去固定等待。
                 textReadBack = target.refresh() && target.isVisibleToUser &&
-                    target.window?.displayId == dispId && target.text?.toString() == text
+                    target.window?.displayId == dispId &&
+                    (if (target.isShowingHintText) "" else target.text?.toString()) == text
                 updatePip(PipMode.RUNNING, "输入文本", null)
                 if (action == PhoneAction.CLEAR_TEXT) "已清空输入框" else "已输入文本 (${text.length} 字)"
             }
