@@ -1,6 +1,7 @@
 package com.akashic.shell;
 
 import android.view.Surface;
+import android.content.Intent;
 
 interface IAkashicShell {
     int createDisplay(in Surface surface, int width, int height, int dpi) = 1;
@@ -14,5 +15,6 @@ interface IAkashicShell {
     int[] identity() = 9;
     void releaseAll() = 10;
     boolean keepAwake(int displayId) = 11;
+    int startIntent(int displayId, in Intent intent) = 12;
     void destroy() = 16777114;
 }

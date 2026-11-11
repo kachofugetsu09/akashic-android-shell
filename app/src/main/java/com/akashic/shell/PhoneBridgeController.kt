@@ -1,7 +1,5 @@
 package com.akashic.shell
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -16,7 +14,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
-import android.os.PersistableBundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
@@ -44,6 +41,11 @@ object PhoneBridgeController {
     private const val RPC_WAKE_LOCK_MS = 120_000L
     private const val PREVIEW_INTERVAL_MS = 500L
     private val BACKOFF_MS = longArrayOf(1_000, 2_000, 5_000, 10_000, 30_000)
+
+    private enum class PhoneAction {
+        LAUNCH_APP, TAP, TYPE_TEXT, CLEAR_TEXT, SCROLL, SWIPE, BACK, PRESS_KEY,
+        OPEN_LINK, SHARE_TEXT, HAND_TO_USER, RESUME_FROM_USER, WAIT,
+    }
 
     private data class ConnectionOwner(val server: String, val connectionId: String)
 
@@ -262,6 +264,7 @@ object PhoneBridgeController {
             displayThread = null
             displayHandler = null
             activePackages.clear()
+            lastNodeRefs = emptyMap()
             takeoverReason = null
             takeoverPackage = null
             latestFullPng = null
@@ -555,16 +558,16 @@ object PhoneBridgeController {
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
                 }
                 "action" -> {
-                    val act = payload.optString("action")
-                    val dispId = if (act == "hand_to_user") virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
+                    val act = readAction(payload)
+                    val dispId = if (act == PhoneAction.HAND_TO_USER) virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
                     lap("awake")
                     val msg = runAction(context, dispId, act, payload)
                     lap("action")
-                    val settleMs = if (act == "launch_app") 1_100L else 480L
+                    val settleMs = if (act == PhoneAction.LAUNCH_APP) 1_100L else 480L
                     SystemClock.sleep(settleMs)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     var screen = buildScreenObject(context, dispId, wantImg)
-                    if (act == "launch_app" && (screen.optJSONArray("nodes")?.length() ?: 0) == 0) {
+                    if (act == PhoneAction.LAUNCH_APP && (screen.optJSONArray("nodes")?.length() ?: 0) == 0) {
                         SystemClock.sleep(800L)
                         screen = buildScreenObject(context, dispId, wantImg)
                     }
@@ -600,87 +603,55 @@ object PhoneBridgeController {
         return response.put("timing", timing)
     }
 
-    private fun runAction(context: Context, dispId: Int, action: String, payload: JSONObject): String {
+    private fun runAction(context: Context, dispId: Int, action: PhoneAction, payload: JSONObject): String {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
+        val backgroundDisplay = sh != null && isTrustedVirtualDisplay && dispId > Display.DEFAULT_DISPLAY
+        check(backgroundDisplay || action == PhoneAction.HAND_TO_USER) { "后台显示器已失效，未接管主屏" }
         return when (action) {
-            "launch_app" -> {
-                val pkg = payload.optString("package_name")
+            PhoneAction.LAUNCH_APP -> {
+                val pkg = payload.getString("package_name")
+                val code = checkNotNull(sh) { "后台助手未连接" }.startApp(dispId, pkg)
+                if (code == 2) error("手机上未找到可启动的应用: $pkg")
+                if (code == 4) error("该应用无法证明可安全创建独立实例，请用户显式移交")
+                check(code == 0) { "后台虚拟屏启动 $pkg 失败 (code=$code)" }
                 synchronized(this) { activePackages.add(pkg) }
                 updatePip(PipMode.RUNNING, "后台运行 $pkg", null)
-                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                    val code = sh.startApp(dispId, pkg)
-                    if (code == 2) error("手机上未找到可启动的应用: $pkg")
-                    if (code != 0) error("UID 2000 后台虚拟屏启动 $pkg 失败 (code=$code)")
-                    "已在后台独立虚拟屏 (#$dispId) 启动应用 $pkg（主屏幕不跳转）"
-                } else {
-                    val intent = context.packageManager.getLaunchIntentForPackage(pkg)
-                        ?: error("手机上未找到可启动的应用: $pkg")
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(intent)
-                    "已启动应用 $pkg（提示：尚未完成无线调试配对，当前在前台启动；在 Akashic 设置中配对无线调试后即可在后台独立虚拟屏运行）"
-                }
+                "已向后台显示器 (#$dispId) 提交启动应用 $pkg 的请求"
             }
-            "tap" -> {
+            PhoneAction.TAP -> {
                 val nodeId = payload.optInt("node_id", -1)
+                val x: Int
+                val y: Int
                 if (nodeId > 0) {
-                    val node = lastNodeRefs[nodeId]
-                    if (node != null) {
-                        val r = Rect()
-                        node.getBoundsInScreen(r)
-                        if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                            if (sh.injectTap(dispId, r.centerX(), r.centerY())) {
-                                updatePip(PipMode.RUNNING, "点击控件 #$nodeId", null)
-                                return "已在后台虚拟屏点击控件 [$nodeId] (${r.centerX()}, ${r.centerY()})"
-                            }
-                        }
-                        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                            updatePip(PipMode.RUNNING, "点击控件 #$nodeId", null)
-                            return "已点击控件 [$nodeId]"
-                        }
-                        if (a11y != null && a11y.performTap(dispId, r.exactCenterX(), r.exactCenterY())) {
-                            updatePip(PipMode.RUNNING, "点击坐标 #$nodeId", null)
-                            return "已通过手势点击控件 [$nodeId]"
-                        }
-                    }
-                }
-                val x = payload.optInt("x", -1)
-                val y = payload.optInt("y", -1)
-                if (x >= 0 && y >= 0) {
-                    if (sh != null && isTrustedVirtualDisplay && dispId > 0 && sh.injectTap(dispId, x, y)) {
-                        updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
-                        return "已在后台虚拟屏点击坐标 ($x, $y)"
-                    }
-                    if (a11y != null && a11y.performTap(dispId, x.toFloat(), y.toFloat())) {
-                        updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
-                        return "已点击坐标 ($x, $y)"
-                    }
-                }
-                error("点击目标不可达，请确认已开启无障碍或无线调试配对")
-            }
-            "type_text" -> {
-                val text = payload.optString("text")
-                val nodeId = payload.optInt("node_id", -1)
-                val targetNode = if (nodeId > 0) lastNodeRefs[nodeId] else lastNodeRefs.values.firstOrNull { it.isFocused || it.isEditable }
-                if (targetNode != null && a11y != null && a11y.setNodeText(targetNode, text)) {
-                    updatePip(PipMode.RUNNING, "输入文本", null)
-                    "已输入文本 (${text.length} 字)"
+                    val node = nodeForAction(dispId, nodeId)
+                    val bounds = Rect()
+                    node.getBoundsInScreen(bounds)
+                    x = bounds.centerX()
+                    y = bounds.centerY()
                 } else {
-                    setClipboardSilently(context, text)
-                    targetNode?.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                    updatePip(PipMode.RUNNING, "粘贴文本", null)
-                    "已通过静默剪贴板填入文本 (${text.length} 字)"
+                    x = payload.getInt("x")
+                    y = payload.getInt("y")
                 }
+                check(sh != null && sh.injectTap(dispId, x, y)) { "后台点击未被接受，请重新观察屏幕" }
+                updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
+                "已在后台显示器点击 ($x, $y)"
             }
-            "clear_text" -> {
+            PhoneAction.TYPE_TEXT, PhoneAction.CLEAR_TEXT -> {
+                val text = if (action == PhoneAction.CLEAR_TEXT) "" else payload.getString("text")
                 val nodeId = payload.optInt("node_id", -1)
-                val targetNode = if (nodeId > 0) lastNodeRefs[nodeId] else lastNodeRefs.values.firstOrNull { it.isFocused || it.isEditable }
-                if (targetNode != null && a11y != null) {
-                    a11y.setNodeText(targetNode, "")
+                val id = if (nodeId > 0) nodeId else lastNodeRefs.entries.firstOrNull {
+                    it.value.isEditable && it.value.isFocused
+                }?.key ?: error("当前没有聚焦输入框，请观察并指定 node_id")
+                val target = nodeForAction(dispId, id)
+                check(target.isEditable) { "目标不是可编辑输入框" }
+                check(a11y != null && a11y.setNodeText(target, text)) {
+                    "输入框拒绝 ACTION_SET_TEXT；未覆盖用户剪贴板，请使用应用支持的输入方式"
                 }
-                "已清空输入框"
+                updatePip(PipMode.RUNNING, "输入文本", null)
+                if (action == PhoneAction.CLEAR_TEXT) "已清空输入框" else "已输入文本 (${text.length} 字)"
             }
-            "scroll" -> {
+            PhoneAction.SCROLL -> {
                 val dir = payload.optString("direction", "down")
                 val dm = context.resources.displayMetrics
                 val cx = dm.widthPixels / 2
@@ -691,59 +662,37 @@ object PhoneBridgeController {
                     "left" -> listOf((dm.widthPixels * 0.8f).toInt(), h / 2, (dm.widthPixels * 0.2f).toInt(), h / 2)
                     else -> listOf((dm.widthPixels * 0.2f).toInt(), h / 2, (dm.widthPixels * 0.8f).toInt(), h / 2)
                 }
-                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                    sh.injectSwipe(dispId, x1, y1, x2, y2, 320)
-                } else {
-                    a11y?.performSwipe(dispId, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), 320L)
-                }
+                check(sh != null && sh.injectSwipe(dispId, x1, y1, x2, y2, 320)) { "后台滚动未被接受" }
                 updatePip(PipMode.RUNNING, "滚动 ($dir)", null)
                 "已执行滚动 ($dir)"
             }
-            "swipe" -> {
-                val x1 = payload.optInt("x", 500)
-                val y1 = payload.optInt("y", 1500)
-                val x2 = payload.optInt("end_x", 500)
-                val y2 = payload.optInt("end_y", 500)
+            PhoneAction.SWIPE -> {
+                val x1 = payload.getInt("x")
+                val y1 = payload.getInt("y")
+                val x2 = payload.getInt("end_x")
+                val y2 = payload.getInt("end_y")
                 val dur = payload.optInt("duration_ms", 300)
-                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                    sh.injectSwipe(dispId, x1, y1, x2, y2, dur)
-                } else {
-                    a11y?.performSwipe(dispId, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur.toLong())
-                }
+                check(sh != null && sh.injectSwipe(dispId, x1, y1, x2, y2, dur)) { "后台滑动未被接受" }
                 "已滑动 ($x1,$y1)->($x2,$y2)"
             }
-            "back" -> {
-                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                    sh.injectKey(dispId, KeyEvent.KEYCODE_BACK)
-                } else {
-                    a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
-                }
+            PhoneAction.BACK -> {
+                check(sh != null && sh.injectKey(dispId, KeyEvent.KEYCODE_BACK)) { "后台返回键未被接受" }
                 "已执行返回键"
             }
-            "press_key" -> {
-                val key = payload.optString("key_code")
-                val code = if (key.equals("BACK", ignoreCase = true)) KeyEvent.KEYCODE_BACK
-                else if (key.equals("ENTER", ignoreCase = true)) KeyEvent.KEYCODE_ENTER
-                else key.toIntOrNull() ?: error("未知按键 $key，请使用 BACK、ENTER 或数字键码")
-                require(code in 1..KeyEvent.getMaxKeyCode()) { "无效按键码 $code" }
-                check(code !in setOf(KeyEvent.KEYCODE_POWER, KeyEvent.KEYCODE_SLEEP, KeyEvent.KEYCODE_WAKEUP, KeyEvent.KEYCODE_SOFT_SLEEP)) {
-                    "后台操作不支持设备电源键，主屏电源由用户控制"
-                }
-                if (sh != null && isTrustedVirtualDisplay && dispId > 0) {
-                    sh.injectKey(dispId, code)
-                } else if (code == KeyEvent.KEYCODE_BACK) {
-                    a11y?.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
-                }
-                "已发送按键 $key"
+            PhoneAction.PRESS_KEY -> {
+                val key = payload.getString("key_code")
+                val code = appKeyCode(key)
+                check(sh != null && sh.injectKey(dispId, code)) { "后台按键未被接受" }
+                "已向后台应用发送按键 $key"
             }
-            "open_link" -> {
+            PhoneAction.OPEN_LINK -> {
                 val uri = payload.optString("uri")
                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                payload.optString("package_name").takeIf { it.isNotEmpty() }?.let { intent.setPackage(it) }
-                context.startActivity(intent)
-                "已打开链接 $uri"
+                if (!payload.isNull("package_name")) payload.optString("package_name").takeIf { it.isNotEmpty() }?.let { intent.setPackage(it) }
+                checkIntentStarted(sh, dispId, intent)
+                "已向后台显示器提交打开链接请求 $uri"
             }
-            "share_text" -> {
+            PhoneAction.SHARE_TEXT -> {
                 val pkg = payload.optString("package_name")
                 val text = payload.optString("text")
                 val intent = Intent(Intent.ACTION_SEND).apply {
@@ -752,10 +701,10 @@ object PhoneBridgeController {
                     if (pkg.isNotEmpty()) setPackage(pkg)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                context.startActivity(intent)
-                "已将文本分享至 $pkg"
+                checkIntentStarted(sh, dispId, intent)
+                "已向后台显示器提交分享界面请求 $pkg"
             }
-            "hand_to_user" -> {
+            PhoneAction.HAND_TO_USER -> {
                 val reason = payload.optString("reason", "需要您在手机主屏幕确认操作")
                 takeoverReason = reason
                 takeoverPackage = activePackages.lastOrNull()
@@ -763,36 +712,92 @@ object PhoneBridgeController {
                 Notifications.showTakeover(context, reason)
                 "已挂起后台操作并通知用户点击右下角橙色呼吸小窗或通知接管 ($reason)"
             }
-            "resume_from_user" -> {
+            PhoneAction.RESUME_FROM_USER -> {
                 val pkg = takeoverPackage ?: activePackages.lastOrNull()
-                if (pkg != null && sh != null && isTrustedVirtualDisplay && dispId > 0) {
+                if (pkg != null && sh != null && backgroundDisplay) {
                     runCatching { sh.moveTaskToDisplay(pkg, dispId) }
                 }
                 takeoverReason = null
                 updatePip(PipMode.RUNNING, "后台恢复运行", null)
                 "已从用户主屏收回控制权继续后台虚拟屏执行"
             }
-            "wait" -> {
-                SystemClock.sleep(payload.optLong("duration_ms", 1000L).coerceIn(100L, 10_000L))
+            PhoneAction.WAIT -> {
+                SystemClock.sleep(payload.optLong("duration_ms", 1000L))
                 "已完成等待"
             }
-            else -> "已执行 $action"
         }
     }
 
-    private fun setClipboardSilently(context: Context, text: String) {
-        runCatching {
-            val cm = context.getSystemService(ClipboardManager::class.java)
-            val clip = ClipData.newPlainText("Akashic", text)
-            val extras = PersistableBundle().apply {
-                putBoolean("com.android.systemui.SUPPRESS_CLIPBOARD_OVERLAY", true)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    putBoolean("android.content.extra.IS_SENSITIVE", true)
-                }
-            }
-            clip.description.extras = extras
-            cm.setPrimaryClip(clip)
+    /** 节点必须仍可见且属于本次后台显示器，禁止用旧缓存操作用户主屏。 */
+    private fun nodeForAction(displayId: Int, nodeId: Int): AccessibilityNodeInfo {
+        val node = lastNodeRefs[nodeId] ?: error("PHONE_NODE_STALE: 节点不存在，请重新观察")
+        check(node.refresh()) { "PHONE_NODE_STALE: 节点已失效，请重新观察" }
+        check(node.window?.displayId == displayId && displayId > Display.DEFAULT_DISPLAY) {
+            "PHONE_WRONG_DISPLAY: 节点已离开后台显示器，未执行操作"
         }
+        check(node.isVisibleToUser) { "PHONE_NODE_STALE: 节点已不可见，请重新观察" }
+        return node
+    }
+
+    private fun checkIntentStarted(shell: IAkashicShell?, displayId: Int, intent: Intent) {
+        val code = checkNotNull(shell) { "后台助手未连接" }.startIntent(displayId, intent)
+        check(code != 4) { "目标主屏任务无法安全创建独立实例，请用户显式移交" }
+        check(code == 0) { "后台目标无法启动 (code=$code)" }
+    }
+
+    private fun appKeyCode(key: String): Int {
+        val code = when (key.uppercase()) {
+            "BACK" -> KeyEvent.KEYCODE_BACK
+            "ENTER" -> KeyEvent.KEYCODE_ENTER
+            else -> key.toIntOrNull() ?: error("未知应用按键 $key")
+        }
+        val allowed = code in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 ||
+            code in KeyEvent.KEYCODE_DPAD_UP..KeyEvent.KEYCODE_DPAD_CENTER ||
+            code in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z ||
+            code in KeyEvent.KEYCODE_COMMA..KeyEvent.KEYCODE_PERIOD ||
+            code == KeyEvent.KEYCODE_TAB || code == KeyEvent.KEYCODE_SPACE ||
+            code in KeyEvent.KEYCODE_ENTER..KeyEvent.KEYCODE_SLASH ||
+            code in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12 ||
+            code in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_RIGHT_PAREN ||
+            code in setOf(KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_AT, KeyEvent.KEYCODE_PLUS,
+                KeyEvent.KEYCODE_PAGE_UP, KeyEvent.KEYCODE_PAGE_DOWN, KeyEvent.KEYCODE_ESCAPE,
+                KeyEvent.KEYCODE_FORWARD_DEL, KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_MOVE_END, KeyEvent.KEYCODE_INSERT)
+        check(allowed) { "后台仅支持应用文字和导航键；HOME、最近任务、音量及电源等系统控制由用户操作" }
+        return code
+    }
+
+    /** 在创建显示器或输入之前校验动作参数，缺值不能静默变成别的动作。 */
+    private fun readAction(payload: JSONObject): PhoneAction {
+        val raw = payload.getString("action")
+        val action = PhoneAction.entries.firstOrNull { it.name.lowercase() == raw }
+            ?: error("未知手机动作: $raw")
+        fun string(name: String) { require(payload.opt(name) is String) { "$name 必须是字符串" } }
+        fun integer(name: String, range: IntRange) {
+            val value = payload.opt(name)
+            require(value is Int && value in range) { "$name 必须是范围 $range 内的整数" }
+        }
+        if (payload.has("node_id") && !payload.isNull("node_id")) integer("node_id", 1..Int.MAX_VALUE)
+        if (payload.has("package_name") && !payload.isNull("package_name")) string("package_name")
+        when (action) {
+            PhoneAction.LAUNCH_APP -> { string("package_name"); require(payload.getString("package_name").isNotBlank()) { "package_name 不能为空" } }
+            PhoneAction.TAP -> if (!payload.has("node_id") || payload.isNull("node_id")) { integer("x", 0..Int.MAX_VALUE); integer("y", 0..Int.MAX_VALUE) }
+            PhoneAction.TYPE_TEXT -> { string("text"); require(payload.getString("text").isNotEmpty()) { "text 不能为空，请用 clear_text 清空" } }
+            PhoneAction.SHARE_TEXT -> { string("text"); string("package_name"); require(payload.getString("package_name").isNotBlank() && payload.getString("text").isNotEmpty()) { "分享必须指定应用与非空文本" } }
+            PhoneAction.SWIPE -> {
+                listOf("x", "y", "end_x", "end_y").forEach { integer(it, 0..Int.MAX_VALUE) }
+                if (payload.has("duration_ms")) integer("duration_ms", 10..10_000)
+            }
+            PhoneAction.SCROLL -> {
+                string("direction")
+                require(payload.getString("direction") in setOf("up", "down", "left", "right")) { "未知滚动方向" }
+            }
+            PhoneAction.PRESS_KEY -> { string("key_code"); appKeyCode(payload.getString("key_code")) }
+            PhoneAction.OPEN_LINK -> { string("uri"); require(payload.getString("uri").isNotBlank()) { "uri 不能为空" } }
+            PhoneAction.HAND_TO_USER -> { string("reason"); require(payload.getString("reason").isNotBlank()) { "移交原因不能为空" } }
+            PhoneAction.WAIT -> if (payload.has("duration_ms")) integer("duration_ms", 10..10_000)
+            else -> Unit
+        }
+        return action
     }
 
     private fun hasFrame(): Boolean = synchronized(frameLock) { frameBitmap != null } || latestFullPng != null
@@ -831,9 +836,7 @@ object PhoneBridgeController {
         val a11y = AkashicAccessibilityService.instance
         val dm = context.resources.displayMetrics
         val readout = a11y?.dumpScreen(dispId)
-        if (readout != null) {
-            lastNodeRefs = readout.nodeRefs
-        }
+        lastNodeRefs = readout?.nodeRefs ?: emptyMap()
         val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
         val resolvedPkg = topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() }
             ?: readout?.packageName

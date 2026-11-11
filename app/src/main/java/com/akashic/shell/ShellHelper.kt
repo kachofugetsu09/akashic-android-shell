@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.ActivityInfo
 import android.database.Cursor
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -217,23 +218,44 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     override fun startApp(displayId: Int, packageName: String): Int {
-        if (synchronized(displays) { displayId !in displays }) return 3
-        // 如果该应用已经在主屏或其他屏存在后台任务，先尝试挪到虚拟屏或直接在虚拟屏启动
         val intent = context.packageManager.getLaunchIntentForPackage(packageName) ?: return 2
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle()
-        val ok = try {
-            val start = taskManager.javaClass.methods.first { it.name == "startActivityAsUser" && it.parameterTypes.size == 12 }
-            val res = start.invoke(
-                taskManager, null, ShellContext.SHELL_PACKAGE, null, intent, null, null, null,
-                0, 0, null, options, -2,
-            ) as Int
-            res >= 0
-        } catch (_: Throwable) {
-            val comp = intent.component?.flattenToShortString() ?: return 2
-            execCmd("am", "start", "--display", "$displayId", "-n", comp) == 0
+        return startIntent(displayId, intent)
+    }
+
+    /** 在所属显示器启动目标，保留主屏现有任务。 */
+    override fun startIntent(displayId: Int, intent: Intent): Int {
+        if (synchronized(displays) { displayId !in displays }) return 3
+        // 1. 解析实际 Activity，并查询实时任务归属，不能用包名的第一个任务代替 owner。
+        val info = context.packageManager.resolveActivity(intent, 0)?.activityInfo ?: return 2
+        val tasks = allTasks()
+        val displayField = taskInfoClass.getField("displayId")
+        val idField = taskInfoClass.getField("taskId")
+        val baseIntentField = taskInfoClass.getField("baseIntent")
+        val realActivityField = taskInfoClass.getField("realActivity")
+        val component = ComponentName(info.packageName, info.targetActivity ?: info.name)
+        val matching = tasks.filter { task ->
+            realActivityField.get(task) == component || (baseIntentField.get(task) as Intent).component == component
         }
-        return if (ok) 0 else 3
+        val owned = matching.firstOrNull { displayField.getInt(it) == displayId }
+        val independent = info.launchMode in setOf(ActivityInfo.LAUNCH_MULTIPLE, ActivityInfo.LAUNCH_SINGLE_TOP, ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK) &&
+            info.documentLaunchMode != ActivityInfo.DOCUMENT_LAUNCH_NEVER
+        // Android 16 跨显示器只选 component/document 的 ideal task，不跨屏选 affinity candidate。
+        if (!independent && matching.any { displayField.getInt(it) != displayId }) return 4
+        // 2. 优先复用 owned VD 的精确 launcher task；新实例明确使用 MULTIPLE_TASK。
+        val launch = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
+        if (owned != null) {
+            options.javaClass.getMethod("setLaunchTaskId", Int::class.javaPrimitiveType).invoke(options, idField.getInt(owned))
+        } else if (independent) {
+            launch.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+        }
+        val start = taskManager.javaClass.methods.first { it.name == "startActivityAsUser" && it.parameterTypes.size == 12 }
+        val result = start.invoke(
+            taskManager, null, ShellContext.SHELL_PACKAGE, null, launch, null, null, null,
+            0, 0, null, options.toBundle(), -2,
+        ) as Int
+        // Android 16 ActivityManager.isStartResultSuccessful；100+ 是非致命启动错误。
+        return if (result in 0..99) 0 else 3
     }
 
     override fun moveTaskToDisplay(packageName: String, targetDisplayId: Int): Boolean {
@@ -264,14 +286,13 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         null
     }
 
-    private fun allTasks(): List<Any> = try {
+    private fun allTasks(): List<Any> {
         val methods = taskManager.javaClass.methods.filter { it.name == "getTasks" }
         val m4 = methods.firstOrNull { it.parameterTypes.size == 4 }
-        val list = if (m4 != null) m4.invoke(taskManager, 50, false, false, Display.INVALID_DISPLAY)
-        else methods.first { it.parameterTypes.size == 3 }.invoke(taskManager, 50, false, false)
-        (list as? List<*>)?.filterNotNull().orEmpty()
-    } catch (_: Throwable) {
-        emptyList()
+        val list = if (m4 != null) m4.invoke(taskManager, Int.MAX_VALUE, false, false, Display.INVALID_DISPLAY)
+        else methods.first { it.parameterTypes.size == 3 }.invoke(taskManager, Int.MAX_VALUE, false, false)
+        @Suppress("UNCHECKED_CAST")
+        return list as List<Any>
     }
 
     override fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
