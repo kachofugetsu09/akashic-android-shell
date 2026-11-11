@@ -22,16 +22,11 @@ import java.util.concurrent.atomic.AtomicReference
 data class ScreenReadout(
     val displayId: Int,
     val packageName: String,
-    val activityName: String,
     val nodes: JSONArray,
     val nodeRefs: Map<Int, AccessibilityNodeInfo>,
 )
 
 class AkashicAccessibilityService : AccessibilityService() {
-    @Volatile var lastPackage: String = "com.akashic.shell"
-        private set
-    @Volatile var lastActivity: String = "MainActivity"
-        private set
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
 
     override fun onServiceConnected() {
@@ -40,17 +35,7 @@ class AkashicAccessibilityService : AccessibilityService() {
         ShellStatus.notifyChanged()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val pkg = event.packageName?.toString().orEmpty()
-            val cls = event.className?.toString().orEmpty()
-            if (pkg.isNotEmpty()) lastPackage = pkg
-            if (cls.isNotEmpty() && !cls.startsWith("android.widget.") && !cls.startsWith("android.view.")) {
-                lastActivity = cls
-            }
-        }
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
 
@@ -61,11 +46,11 @@ class AkashicAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    /** 只读取本次目标显示器的应用身份，不借用其它显示器的历史事件。 */
     fun dumpScreen(targetDisplayId: Int): ScreenReadout {
         val nodeArray = JSONArray()
         val refs = LinkedHashMap<Int, AccessibilityNodeInfo>()
-        var pkgName = lastPackage
-        var actName = lastActivity
+        val packages = LinkedHashSet<String>()
 
         val roots = ArrayList<AccessibilityNodeInfo>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -80,8 +65,9 @@ class AkashicAccessibilityService : AccessibilityService() {
                     ) {
                         win.root?.let { root ->
                             roots.add(root)
-                            if (root.packageName != null && (win.isActive || win.isFocused || roots.size == 1)) {
-                                pkgName = root.packageName.toString()
+                            if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                                root.packageName != null && (win.isActive || win.isFocused)) {
+                                root.packageName.toString().takeIf { it.isNotEmpty() }?.let(packages::add)
                             }
                         }
                     }
@@ -91,7 +77,6 @@ class AkashicAccessibilityService : AccessibilityService() {
         if (roots.isEmpty() && targetDisplayId == Display.DEFAULT_DISPLAY) {
             rootInActiveWindow?.let { root ->
                 roots.add(root)
-                if (root.packageName != null) pkgName = root.packageName.toString()
             }
         }
 
@@ -131,7 +116,7 @@ class AkashicAccessibilityService : AccessibilityService() {
         }
 
         for (r in roots) traverse(r, 0)
-        return ScreenReadout(targetDisplayId, pkgName, actName, nodeArray, refs)
+        return ScreenReadout(targetDisplayId, packages.singleOrNull().orEmpty(), nodeArray, refs)
     }
 
     fun performTap(displayId: Int, x: Float, y: Float, durationMs: Long = 55L): Boolean {
