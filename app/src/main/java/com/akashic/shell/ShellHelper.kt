@@ -251,7 +251,7 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         }
         val start = taskManager.javaClass.methods.first { it.name == "startActivityAsUser" && it.parameterTypes.size == 12 }
         val result = start.invoke(
-            taskManager, null, ShellContext.SHELL_PACKAGE, null, launch, null, null, null,
+            taskManager, null, ShellContext.SHELL_PACKAGE, null, launch, launch.resolveTypeIfNeeded(context.contentResolver), null, null,
             0, 0, null, options.toBundle(), -2,
         ) as Int
         // Android 16 ActivityManager.isStartResultSuccessful；100+ 是非致命启动错误。
