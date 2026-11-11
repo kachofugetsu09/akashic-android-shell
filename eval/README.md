@@ -3,6 +3,8 @@
 这是确定性设备测试，不是模型任务成功率。它经过真实 `PhoneBridge.rpc`、SSE、
 手机执行器和真实输入控件；用独立 ContentProvider 检查内容及提交计数。
 fixture 是独立包 `dev.akashic.phoneeval`，不打包进 Shell，也不访问生产数据。
+runner 要求 Shell 0.5.0 的 `snapshot_ref` 协议：每个节点动作原样回传所属观察的引用，
+缺失时直接失败，不自动用最新引用替换。正式工具链配套使用 phone-use 0.3.0。
 
 ```text
 eval/run.py ── HTTP ── 真实 PhoneBridge ── SSE ── Shell 虚拟屏

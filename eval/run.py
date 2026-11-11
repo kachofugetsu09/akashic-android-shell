@@ -154,18 +154,18 @@ def main() -> int:
                 result["goal"] = goal
                 screen = observe()
                 check_window(screen["display_id"])
-                rpc("action", {"action": "clear_text", "node_id": field(screen)})
+                rpc("action", {"action": "clear_text", "node_id": field(screen), "snapshot_ref": screen["snapshot_ref"]})
                 if oracle()["text"] != "":
                     raise RuntimeError("clear_text 返回后独立存储未清空")
                 screen = observe()
-                rpc("action", {"action": "type_text", "node_id": field(screen), "text": goal})
+                rpc("action", {"action": "type_text", "node_id": field(screen), "snapshot_ref": screen["snapshot_ref"], "text": goal})
                 if oracle()["text"] != goal:
                     raise RuntimeError("输入与独立存储不一致")
                 screen = observe()
                 buttons = [n for n in screen["nodes"] if n["text"].casefold() == "submit text"]
                 if len(buttons) != 1:
                     raise RuntimeError("无法唯一识别提交按钮")
-                rpc("action", {"action": "tap", "node_id": buttons[0]["node_id"]})
+                rpc("action", {"action": "tap", "node_id": buttons[0]["node_id"], "snapshot_ref": screen["snapshot_ref"]})
                 after = oracle()
                 check_window(screen["display_id"])
                 result.update(before=before, after=after)
