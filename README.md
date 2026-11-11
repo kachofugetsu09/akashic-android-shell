@@ -91,3 +91,20 @@ RPC UUID ──► 最终 screen + 节点映射 ──► snapshot_ref + 短 nod
 动作 ◄──────────────────────────────────────────┘
   └─ effectLock 内先核对引用、连接与显示器代际，再读取节点
 ```
+
+## 帧缓存的显示器归属
+
+raw 帧、整屏 PNG 和预览都归属创建它们的 `ImageReader`。释放或替换 reader 时一起清空；
+旧回调、已取得的旧 Image 和锁外完成的旧预览编码不能重新填充缓存。
+`DONE` 小窗仅显式保留刚释放 reader 的最后预览，不供整屏截图或新 reader 复用。
+静态观察仍可复用同一有效 reader 的帧，不要求画面无变化时强制产生新帧。
+
+这只保证 reader 生命周期，尚不保证动作后的生产者新帧。不能把回调到达时间当作生产时间，
+也不能假定所有 `Image.timestamp` 与 `System.nanoTime()` 同钟。动作后帧的时间基准与屏障另需
+限定 owned SurfaceFlinger VD 来源并做真机校准；本改动没有以等待超时后返回旧图来假装满足该合同。
+
+`probes/FrameOwnerProbe.java` 是独立 `app_process` 原生探针，通过候选 debug APK 的真实
+Controller 和 Android `ImageReader` / `ImageWriter` 校验缓存。它不安装 APK、不连接助手、
+不创建显示器或修改正在运行的 App 单例。baseline 模式只复现 release 遗留预览；candidate
+模式验证真实 RGBA→PNG、同帧复用、退役 reader 拒绝发布和 DONE 分离。它不替代真实 VD、
+动作后新帧或最终 release/R8 应用验收。
