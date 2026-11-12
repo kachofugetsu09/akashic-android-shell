@@ -12,11 +12,12 @@
 - 同一时刻只执行一个请求，其余返回 `PHONE_BUSY`；结果不明的请求不会自动重放。
 - `hand_to_user` 把后台任务移到主屏交给用户，`resume_from_user` 只把这一个任务移回去。
 - `finish` 释放整块后台显示器。普通虚拟屏与主屏共享音频焦点，`audio_muted` 恒为 false。
-- App 进程退出时助手随之退出；再次启用需要无线调试可用。
+- App 进程退出时助手随之退出。首次经无线调试（需 Wi-Fi）启动时会把 adbd 切到本机 `127.0.0.1:5555`，
+  之后用流量也能重新拉起助手；手机重启后需连一次 Wi-Fi 恢复。首次连 5555 时手机会询问是否允许调试。
 
 ## 版本配套
 
-Shell 0.5.0 需要 phone-use 0.3.0 或更新版本（SSE `connection_id` 与 `snapshot_ref` 协议）。
+Shell 0.5.x 需要 phone-use 0.3.0 或更新版本（SSE `connection_id` 与 `snapshot_ref` 协议）。
 旧服务端连接时，设置页会显示升级提示。
 
 ## 构建

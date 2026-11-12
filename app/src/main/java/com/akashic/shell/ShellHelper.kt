@@ -700,8 +700,8 @@ object ShellHelperHub {
         if (shell != null) return
         val prefs = ShellPrefs(context)
         val candidates = LinkedHashSet<Int>()
-        // 优先尝试 5555（adbd tcpip 5555 模式在切换移动数据流量时依然监听 127.0.0.1:5555）
-        candidates.add(5555)
+        // 优先尝试 tcpip 端口：它不依赖 Wi-Fi，用流量时也监听 127.0.0.1。
+        candidates.add(LOOPBACK_ADB_PORT)
         prefs.lastAdbConnectPort.takeIf { it > 0 }?.let { candidates.add(it) }
         runCatching {
             val prop = Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
@@ -720,9 +720,11 @@ object ShellHelperHub {
         var lastErr: Throwable? = null
         for (port in candidates) {
             try {
-                AdbConnection.open(context, port, timeoutMs = if (port == 5555) 2_500 else 6_000).use { conn ->
-                    if (port != 5555) prefs.setLastAdbConnectPort(port)
-                    prefs.setAdbPaired(true)
+                val opened = AdbConnection.open(context, port, timeoutMs = if (port == LOOPBACK_ADB_PORT) 2_500 else 6_000)
+                if (port != LOOPBACK_ADB_PORT) prefs.setLastAdbConnectPort(port)
+                prefs.setAdbPaired(true)
+                val target = if (port == LOOPBACK_ADB_PORT) opened else switchToLoopback(context, opened)
+                target.use { conn ->
                     val latch = CountDownLatch(1)
                     handoffLatch = latch
                     val apk = context.applicationInfo.sourceDir
@@ -742,4 +744,23 @@ object ShellHelperHub {
             throw lastErr ?: IllegalStateException("无法连接本机无线调试端口")
         }
     }
+
+    // 无线调试只在 Wi-Fi 下监听；经它切到 tcpip 后，127.0.0.1:5555 保持到手机重启，换成流量也能重启助手。
+    // adbd 切换会杀掉它拉起的进程，所以先切换，再经新端口启动助手。
+    private fun switchToLoopback(context: Context, wireless: AdbConnection): AdbConnection {
+        wireless.use { conn -> runCatching { conn.open("tcpip:$LOOPBACK_ADB_PORT").use { Thread.sleep(500) } } }
+        var lastErr: Throwable? = null
+        repeat(20) {
+            Thread.sleep(500)
+            try {
+                return AdbConnection.open(context, LOOPBACK_ADB_PORT, timeoutMs = 2_500)
+            } catch (t: java.net.ConnectException) {
+                // adbd 重启中，端口尚未监听；其余错误（如手机上拒绝授权）直接上抛。
+                lastErr = t
+            }
+        }
+        throw IllegalStateException("adbd 未切到 127.0.0.1:$LOOPBACK_ADB_PORT", lastErr)
+    }
+
+    private const val LOOPBACK_ADB_PORT = 5555
 }
