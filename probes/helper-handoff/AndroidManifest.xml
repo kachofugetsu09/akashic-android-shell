@@ -1,7 +1,0 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.akashic.hubprobe.test">
-    <uses-sdk android:minSdkVersion="36" android:targetSdkVersion="36" />
-    <application android:label="Binder handoff diagnostic" android:testOnly="true">
-        <service android:name="dev.akashic.hubprobe.RemoteOwner" android:process=":owner" android:exported="true" />
-    </application>
-    <instrumentation android:name="dev.akashic.hubprobe.HubProbe" android:targetPackage="com.akashic.shell.debug" />
-</manifest>

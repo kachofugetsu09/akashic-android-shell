@@ -1,5 +1,0 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.akashic.selfkillprobe">
- <uses-sdk android:minSdkVersion="36" android:targetSdkVersion="36" />
- <application android:label="Own-process diagnostic" android:testOnly="true" />
- <instrumentation android:name="dev.akashic.selfkill.SelfKillProbe" android:targetPackage="com.akashic.shell" />
-</manifest>

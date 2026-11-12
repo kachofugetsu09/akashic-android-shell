@@ -11,10 +11,8 @@ android {
         applicationId = "com.akashic.shell"
         minSdk = 30
         targetSdk = 36
-        testInstrumentationRunner = providers.gradleProperty("probeRunner").getOrElse("android.test.InstrumentationTestRunner")
         versionCode = 15
         versionName = "0.5.0"
-        testInstrumentationRunner = providers.gradleProperty("probeRunner").getOrElse("android.test.InstrumentationTestRunner")
     }
 
     buildFeatures {
@@ -53,8 +51,4 @@ kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
-}
-
-dependencies {
-    testImplementation("junit:junit:4.13.2")
 }

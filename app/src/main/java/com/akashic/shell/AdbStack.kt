@@ -23,11 +23,9 @@ import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.GeneralSecurityException
 import java.security.KeyFactory
@@ -48,7 +46,6 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.RSAKeyGenParameterSpec
 import java.security.spec.RSAPublicKeySpec
 import java.util.Base64
-import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -252,8 +249,8 @@ class AdbIdentity(val keyPair: KeyPair, val name: String) {
             return load(file, "akashic@${Build.MODEL}", repair, ::wrappingKey).also { cached = it }
         }
 
-        /** 加载持久身份；只有显式配对可以备份并替换损坏的密文。 */
-        internal fun load(
+        // 加载持久身份；只有显式配对可以替换损坏的密文。
+        private fun load(
             file: File,
             name: String,
             repair: Boolean,
@@ -274,12 +271,8 @@ class AdbIdentity(val keyPair: KeyPair, val name: String) {
                 } catch (e: GeneralSecurityException) {
                     e
                 }
+                // 只有重新配对才能替换读不出的身份；连接失败时保留原件。
                 if (!repair) throw IOException("Cannot read saved ADB identity; pair again to repair it", failure)
-                // 备份只保留密文字节，不能恢复已经丢失的 AndroidKeyStore 密钥。
-                val backup = File(file.parentFile, "${file.name}.before-pairing-${UUID.randomUUID()}.bak")
-                Files.copy(file.toPath(), backup.toPath())
-                FileOutputStream(backup, true).use { it.fd.sync() }
-                syncDirectory(backup.absoluteFile.parentFile!!)
             }
 
             // 2. 保存成功后才允许调用方缓存或使用新身份。
@@ -299,17 +292,10 @@ class AdbIdentity(val keyPair: KeyPair, val name: String) {
                     stream.fd.sync()
                 }
                 Files.move(temp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                syncDirectory(parent)
-                // 首次创建 adb 目录时，也同步它在 noBackupFilesDir 中的目录项。
-                parent.parentFile?.let { syncDirectory(it) }
             } finally {
                 temp.delete()
             }
             return id
-        }
-
-        private fun syncDirectory(directory: File) {
-            FileChannel.open(directory.toPath(), StandardOpenOption.READ).use { it.force(true) }
         }
 
         /** 验证密文边界后解密并恢复原 RSA 公钥。 */
