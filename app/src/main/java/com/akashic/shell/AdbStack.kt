@@ -542,6 +542,9 @@ class AdbMessage(val command: Int, val arg0: Int, val arg1: Int, val data: ByteA
         const val CLSE = 0x45534c43
         const val WRTE = 0x45545257
         const val STLS = 0x534c5453
+        const val AUTH = 0x48545541
+        const val AUTH_SIGNATURE = 2
+        const val AUTH_RSAPUBLICKEY = 3
         const val VERSION = 0x01000001
         const val STLS_VERSION = 0x01000000
         const val MAX_PAYLOAD = 1024 * 1024
@@ -608,11 +611,13 @@ class AdbConnection private constructor(
         }
     }
 
-    fun exec(cmd: String): Stream {
+    fun exec(cmd: String): Stream = open("exec:$cmd")
+
+    fun open(service: String): Stream {
         val s = Stream(nextId.getAndIncrement())
         streams[s.localId] = s
-        send(AdbMessage(AdbMessage.OPEN, s.localId, 0, ("exec:$cmd\u0000").toByteArray(Charsets.UTF_8)))
-        if (!s.opened.get(10, TimeUnit.SECONDS)) error("adb exec refused")
+        send(AdbMessage(AdbMessage.OPEN, s.localId, 0, ("$service\u0000").toByteArray(Charsets.UTF_8)))
+        if (!s.opened.get(10, TimeUnit.SECONDS)) error("adb $service refused")
         return s
     }
 
@@ -659,9 +664,11 @@ class AdbConnection private constructor(
             plain.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
             plain.soTimeout = timeoutMs
             val out = plain.getOutputStream()
+            val plainInput = DataInputStream(plain.getInputStream())
             out.write(AdbMessage(AdbMessage.CNXN, AdbMessage.VERSION, AdbMessage.MAX_PAYLOAD, "host::\u0000".toByteArray()).encode())
             out.flush()
-            val first = AdbMessage.read(DataInputStream(plain.getInputStream())) ?: error("adb closed")
+            var first = AdbMessage.read(plainInput) ?: error("adb closed")
+            if (first.command == AdbMessage.AUTH) first = legacyAuth(plain, out, plainInput, first, tls.identity)
             if (first.command == AdbMessage.STLS) {
                 out.write(AdbMessage(AdbMessage.STLS, AdbMessage.STLS_VERSION, 0).encode())
                 out.flush()
@@ -674,10 +681,36 @@ class AdbConnection private constructor(
             }
             if (first.command == AdbMessage.CNXN) {
                 plain.soTimeout = 0
-                return AdbConnection(plain, DataInputStream(plain.getInputStream()), out, first.arg1.coerceAtLeast(4096))
+                return AdbConnection(plain, plainInput, out, first.arg1.coerceAtLeast(4096))
             }
             plain.close()
             error("unexpected adb handshake")
         }
+
+        // tcpip 端口走 RSA 挑战：先用本机 adb 密钥签名；未授权时提交公钥，等用户在手机上点「始终允许」。
+        private fun legacyAuth(
+            socket: Socket,
+            out: OutputStream,
+            input: DataInputStream,
+            token: AdbMessage,
+            identity: AdbIdentity,
+        ): AdbMessage {
+            val signer = Signature.getInstance("NONEwithRSA").apply { initSign(identity.keyPair.private) }
+            signer.update(SHA1_DIGEST_INFO + token.data)
+            out.write(AdbMessage(AdbMessage.AUTH, AdbMessage.AUTH_SIGNATURE, 0, signer.sign()).encode())
+            out.flush()
+            val reply = AdbMessage.read(input) ?: error("adb closed")
+            if (reply.command != AdbMessage.AUTH) return reply
+            val key = (identity.adbPublicKey + "\u0000").toByteArray(Charsets.UTF_8)
+            out.write(AdbMessage(AdbMessage.AUTH, AdbMessage.AUTH_RSAPUBLICKEY, 0, key).encode())
+            out.flush()
+            socket.soTimeout = 60_000
+            return AdbMessage.read(input) ?: error("手机上未允许 Akashic 的调试连接")
+        }
+
+        // adbd 用 RSA_sign(NID_sha1) 校验：签名内容是 SHA-1 DigestInfo 前缀加 20 字节令牌。
+        private val SHA1_DIGEST_INFO = byteArrayOf(
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+        )
     }
 }

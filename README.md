@@ -16,7 +16,7 @@
 
 ## 版本配套
 
-Shell 0.5.0 需要 phone-use 0.3.0 或更新版本（SSE `connection_id` 与 `snapshot_ref` 协议）。
+Shell 0.5.x 需要 phone-use 0.3.0 或更新版本（SSE `connection_id` 与 `snapshot_ref` 协议）。
 旧服务端连接时，设置页会显示升级提示。
 
 ## 构建
