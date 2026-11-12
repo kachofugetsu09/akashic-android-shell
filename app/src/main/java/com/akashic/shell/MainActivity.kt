@@ -79,10 +79,10 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
     override fun onResume() {
         super.onResume()
         ShellStatus.listener = ::refreshPanel
-        PhoneBridgeController.pipListener = { mode, label, png ->
-            pipView.updateState(mode, label, png)
+        PhoneBridgeController.pipListener = { _, _, _ ->
+            pipView.updateState(PhoneBridgeController::currentPipState)
         }
-        pipView.updateState(PhoneBridgeController.pipMode, PhoneBridgeController.pipLabel, PhoneBridgeController.latestPreviewPng)
+        pipView.updateState(PhoneBridgeController::currentPipState)
         NotifyService.sync(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()
@@ -122,7 +122,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         panel = createPanelWebView()
         panel.visibility = View.GONE
-        pipView = AgentPipView(this) { PhoneBridgeController.handleTakeoverTap(this) }
+        pipView = AgentPipView(this) { PhoneBridgeController.handleTakeoverTap() }
         root.addView(pipView, pipView.defaultLayoutParams())
         root.addView(panel, fill())
         setContentView(root)
@@ -200,6 +200,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         .put("connectionLabel", ShellStatus.connection.label)
         .put("phoneUseEnabled", prefs.phoneUseEnabled)
         .put("phoneConnected", PhoneBridgeController.connected)
+        .put("phoneConnectionError", PhoneBridgeController.connectionError ?: "")
         .put("accessibilityEnabled", AkashicAccessibilityService.instance != null)
         .put("adbHelperActive", ShellHelperHub.shell != null)
         .put("adbHelperStatus", ShellHelperHub.statusText)
@@ -356,7 +357,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
 
     override fun setPhoneUse(enable: Boolean) {
         prefs.setPhoneUseEnabled(enable)
-        PhoneBridgeController.sync(this)
+        NotifyService.sync(this)
         refreshPanel()
     }
 

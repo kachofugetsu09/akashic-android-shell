@@ -101,14 +101,12 @@ class AgentPipView(
         }
     }
 
-    fun updateState(newMode: PipMode, label: String, pngBytes: ByteArray? = null) {
+    fun updateState(readState: () -> Triple<PipMode, String, ByteArray?>) {
         post {
-            if (pngBytes != null && pngBytes.isNotEmpty()) {
-                runCatching {
-                    BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)?.let { bmp ->
-                        frame = bmp
-                    }
-                }
+            // UI 队列执行时再读当前状态，不能重绘排队期间已退役的屏幕。
+            val (newMode, label, pngBytes) = readState()
+            frame = pngBytes?.takeIf { it.isNotEmpty() }?.let {
+                BitmapFactory.decodeByteArray(it, 0, it.size)
             }
             mode = newMode
             statusText = label

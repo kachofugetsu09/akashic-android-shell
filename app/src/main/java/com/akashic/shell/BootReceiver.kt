@@ -1,15 +1,24 @@
 package com.akashic.shell
 
+import android.app.ForegroundServiceStartNotAllowedException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.util.Log
 
 // 开机、应用更新后恢复通知连接；或从通知栏 RemoteInput 直接接收无线调试配对码。
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
-                if (NotifyService.shouldRun(context)) NotifyService.sync(context)
+                if (NotifyService.shouldRun(context)) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        startAfterBroadcast(context, intent.action)
+                    } else {
+                        NotifyService.sync(context)
+                    }
+                }
             }
             Notifications.ACTION_PAIR_FROM_NOTIFICATION -> {
                 val results = android.app.RemoteInput.getResultsFromIntent(intent)
@@ -26,6 +35,17 @@ class BootReceiver : BroadcastReceiver() {
                     }
                 }
             }
+        }
+    }
+
+    /** 自动启动被平台拒绝是未连接状态，不让 receiver 的异常再杀掉 App。 */
+    @android.annotation.TargetApi(Build.VERSION_CODES.S)
+    private fun startAfterBroadcast(context: Context, action: String?) {
+        try {
+            NotifyService.sync(context)
+        } catch (error: ForegroundServiceStartNotAllowedException) {
+            Log.w("AkashicBoot", "Background service not started after $action: platform denied foreground start", error)
+            ShellStatus.update(ConnectionState.BACKGROUND_BLOCKED)
         }
     }
 }

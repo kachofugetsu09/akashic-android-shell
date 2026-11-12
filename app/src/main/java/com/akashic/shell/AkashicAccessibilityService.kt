@@ -22,16 +22,13 @@ import java.util.concurrent.atomic.AtomicReference
 data class ScreenReadout(
     val displayId: Int,
     val packageName: String,
-    val activityName: String,
     val nodes: JSONArray,
     val nodeRefs: Map<Int, AccessibilityNodeInfo>,
 )
 
+data class CapturedScreenshot(val png: ByteArray, val uptimeMs: Long)
+
 class AkashicAccessibilityService : AccessibilityService() {
-    @Volatile var lastPackage: String = "com.akashic.shell"
-        private set
-    @Volatile var lastActivity: String = "MainActivity"
-        private set
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
 
     override fun onServiceConnected() {
@@ -40,17 +37,7 @@ class AkashicAccessibilityService : AccessibilityService() {
         ShellStatus.notifyChanged()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val pkg = event.packageName?.toString().orEmpty()
-            val cls = event.className?.toString().orEmpty()
-            if (pkg.isNotEmpty()) lastPackage = pkg
-            if (cls.isNotEmpty() && !cls.startsWith("android.widget.") && !cls.startsWith("android.view.")) {
-                lastActivity = cls
-            }
-        }
-    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
     override fun onInterrupt() {}
 
@@ -61,11 +48,11 @@ class AkashicAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    /** 只读取本次目标显示器的应用身份，不借用其它显示器的历史事件。 */
     fun dumpScreen(targetDisplayId: Int): ScreenReadout {
         val nodeArray = JSONArray()
         val refs = LinkedHashMap<Int, AccessibilityNodeInfo>()
-        var pkgName = lastPackage
-        var actName = lastActivity
+        val packages = LinkedHashSet<String>()
 
         val roots = ArrayList<AccessibilityNodeInfo>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -80,8 +67,9 @@ class AkashicAccessibilityService : AccessibilityService() {
                     ) {
                         win.root?.let { root ->
                             roots.add(root)
-                            if (root.packageName != null && (win.isActive || win.isFocused || roots.size == 1)) {
-                                pkgName = root.packageName.toString()
+                            if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                                root.packageName != null && (win.isActive || win.isFocused)) {
+                                root.packageName.toString().takeIf { it.isNotEmpty() }?.let(packages::add)
                             }
                         }
                     }
@@ -91,7 +79,6 @@ class AkashicAccessibilityService : AccessibilityService() {
         if (roots.isEmpty() && targetDisplayId == Display.DEFAULT_DISPLAY) {
             rootInActiveWindow?.let { root ->
                 roots.add(root)
-                if (root.packageName != null) pkgName = root.packageName.toString()
             }
         }
 
@@ -131,7 +118,7 @@ class AkashicAccessibilityService : AccessibilityService() {
         }
 
         for (r in roots) traverse(r, 0)
-        return ScreenReadout(targetDisplayId, pkgName, actName, nodeArray, refs)
+        return ScreenReadout(targetDisplayId, packages.singleOrNull().orEmpty(), nodeArray, refs)
     }
 
     fun performTap(displayId: Int, x: Float, y: Float, durationMs: Long = 55L): Boolean {
@@ -211,46 +198,49 @@ class AkashicAccessibilityService : AccessibilityService() {
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
-    fun captureScreenshotPng(displayId: Int): ByteArray? {
+    fun captureScreenshotPng(displayId: Int): CapturedScreenshot? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         val latch = CountDownLatch(1)
-        val ref = AtomicReference<ByteArray?>(null)
+        val ref = AtomicReference<CapturedScreenshot?>(null)
+        val failure = AtomicReference<RuntimeException?>(null)
         try {
             takeScreenshot(
                 displayId,
                 screenshotExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
+                        val buffer = screenshot.hardwareBuffer
                         try {
-                            val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                            val hw = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
                             if (hw != null) {
-                                val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
-                                hw.recycle()
-                                screenshot.hardwareBuffer.close()
+                                val sw = try { hw.copy(Bitmap.Config.ARGB_8888, false) } finally { hw.recycle() }
                                 if (sw != null) {
-                                    val out = ByteArrayOutputStream()
-                                    sw.compress(Bitmap.CompressFormat.PNG, 90, out)
-                                    sw.recycle()
-                                    ref.set(out.toByteArray())
+                                    try {
+                                        val out = ByteArrayOutputStream()
+                                        check(sw.compress(Bitmap.CompressFormat.PNG, 90, out)) { "无障碍截图 PNG 编码失败" }
+                                        ref.set(CapturedScreenshot(out.toByteArray(), screenshot.timestamp))
+                                    } finally { sw.recycle() }
                                 }
-                            } else {
-                                screenshot.hardwareBuffer.close()
                             }
-                        } catch (_: Throwable) {
+                        } catch (error: RuntimeException) {
+                            failure.set(error)
                         } finally {
+                            buffer.close()
                             latch.countDown()
                         }
                     }
 
                     override fun onFailure(errorCode: Int) {
+                        failure.set(IllegalStateException("PHONE_SCREENSHOT_FAILED: code=$errorCode"))
                         latch.countDown()
                     }
                 },
             )
             latch.await(5, TimeUnit.SECONDS)
-        } catch (_: Throwable) {
-            return null
+        } catch (error: RuntimeException) {
+            throw IllegalStateException("PHONE_SCREENSHOT_FAILED: ${error.message}", error)
         }
+        failure.get()?.let { throw it }
         return ref.get()
     }
 

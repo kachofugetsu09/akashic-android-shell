@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.ActivityInfo
 import android.database.Cursor
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -23,6 +24,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.Process
+import android.os.RemoteException
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
@@ -32,6 +34,8 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
@@ -115,45 +119,54 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         return super.onTransact(code, data, reply, flags)
     }
 
-    override fun identity(): IntArray = intArrayOf(Process.myUid(), Process.myPid())
+    override fun identity(): IntArray = intArrayOf(Process.myUid(), Process.myPid(), IAkashicShell.TASK_TRANSFER_VERSION)
 
     override fun createDisplay(surface: Surface, width: Int, height: Int, dpi: Int): Int {
         return try {
-            createVirtualDisplay(surface, width, height, dpi, trusted = true)
-        } catch (_: SecurityException) {
-            runCatching { createVirtualDisplay(surface, width, height, dpi, trusted = false) }.getOrDefault(-1)
+            createVirtualDisplay(surface, width, height, dpi)
         } catch (t: Throwable) {
             Log.e(TAG, "createDisplay failed", t)
             -1
         }
     }
 
-    private fun createVirtualDisplay(surface: Surface, width: Int, height: Int, dpi: Int, trusted: Boolean): Int {
+    private fun createVirtualDisplay(surface: Surface, width: Int, height: Int, dpi: Int): Int {
         var flags = (1 shl 0) or (1 shl 3) or (1 shl 6) or (1 shl 7) or (1 shl 8)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             flags = flags or (1 shl 13)
-            if (trusted) flags = flags or (1 shl 10) or (1 shl 11) or (1 shl 12)
+            flags = flags or (1 shl 10) or (1 shl 11) or (1 shl 12)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && trusted) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // OWN_FOCUS (1<<14) + STEAL_TOP_FOCUS_DISABLED (1<<16)：独立焦点且绝不抢主屏焦点
             flags = flags or (1 shl 14) or (1 shl 16)
         }
         val vd = displayManager.createVirtualDisplay("akashic-agent", width, height, dpi, surface, flags)
         val id = vd.display.displayId
+        try {
+            check(id > Display.DEFAULT_DISPLAY && vd.display.flags and REQUIRED_DISPLAY_FLAGS == REQUIRED_DISPLAY_FLAGS) {
+                "后台显示器缺少实际生效的隔离标志 (flags=${vd.display.flags})"
+            }
+            setFullscreenAndImePolicy(id)
+        } catch (error: Exception) {
+            vd.release()
+            throw error
+        }
         synchronized(displays) { displays[id] = vd }
         renewLease(id)
-        setFullscreenAndImePolicy(id)
         return id
     }
 
     // 虚拟屏带 OWN_DISPLAY_GROUP，有独立电源组：主屏熄灭后它会按无操作超时单独休眠，之后只出黑帧。
-    // 每次端侧操作续一次租约，租约内每 4 秒上报一次该屏的用户活动；已经睡着就往该屏注入 WAKEUP 唤醒。
+    // 每次端侧操作续一次租约；恢复时只唤醒独立电源组，WAKEUP 按键会被系统路由到主屏。
     override fun keepAwake(displayId: Int): Boolean {
         if (synchronized(displays) { displayId !in displays }) return false
+        val display = displayManager.getDisplay(displayId) ?: return false
+        // Display.FLAG_OWN_DISPLAY_GROUP 是实际生效的标志，不是创建时请求的标志。
+        if (displayId <= Display.DEFAULT_DISPLAY || display.flags and (1 shl 8) == 0) return false
         renewLease(displayId)
         power.userActivity(displayId)
         if (power.isInteractive(displayId)) return true
-        injectKey(displayId, KeyEvent.KEYCODE_WAKEUP)
+        power.wakeUp(displayId)
         repeat(10) {
             SystemClock.sleep(100L)
             if (power.isInteractive(displayId)) return true
@@ -173,16 +186,20 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
                 awakeLeases.entries.removeAll { it.value <= now }
                 awakeLeases.keys.toList()
             }
-            live.forEach { power.userActivity(it) }
+            live.forEach { id ->
+                runCatching { power.userActivity(id) }
+                    .onFailure { Log.w(TAG, "userActivity($id) failed", it) }
+            }
         }
     }
 
     @SuppressLint("PrivateApi")
     private fun setFullscreenAndImePolicy(displayId: Int) {
-        runCatching {
-            val wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null)!!
-            runCatching { wm.javaClass.getMethod("setWindowingMode", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 1) }
-            runCatching { wm.javaClass.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 0) }
+        val wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null)!!
+        runCatching { wm.javaClass.getMethod("setWindowingMode", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 1) }
+        wm.javaClass.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).invoke(wm, displayId, 0)
+        check(wm.javaClass.getMethod("getDisplayImePolicy", Int::class.javaPrimitiveType).invoke(wm, displayId) == 0) {
+            "后台显示器没有使用本地输入法，已拒绝创建"
         }
     }
 
@@ -204,39 +221,85 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     override fun startApp(displayId: Int, packageName: String): Int {
-        if (synchronized(displays) { displayId !in displays }) return 3
-        // 如果该应用已经在主屏或其他屏存在后台任务，先尝试挪到虚拟屏或直接在虚拟屏启动
         val intent = context.packageManager.getLaunchIntentForPackage(packageName) ?: return 2
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle()
-        val ok = try {
-            val start = taskManager.javaClass.methods.first { it.name == "startActivityAsUser" && it.parameterTypes.size == 12 }
-            val res = start.invoke(
-                taskManager, null, ShellContext.SHELL_PACKAGE, null, intent, null, null, null,
-                0, 0, null, options, -2,
-            ) as Int
-            res >= 0
-        } catch (_: Throwable) {
-            val comp = intent.component?.flattenToShortString() ?: return 2
-            execCmd("am", "start", "--display", "$displayId", "-n", comp) == 0
-        }
-        return if (ok) 0 else 3
+        return startIntent(displayId, intent)
     }
 
-    override fun moveTaskToDisplay(packageName: String, targetDisplayId: Int): Boolean {
+    /** 在所属显示器启动目标，保留主屏现有任务。 */
+    override fun startIntent(displayId: Int, intent: Intent): Int {
+        if (synchronized(displays) { displayId !in displays }) return 3
+        // 1. 解析实际 Activity，并查询实时任务归属，不能用包名的第一个任务代替 owner。
+        val info = context.packageManager.resolveActivity(intent, 0)?.activityInfo ?: return 2
+        val tasks = allTasks()
+        val displayField = taskInfoClass.getField("displayId")
+        val idField = taskInfoClass.getField("taskId")
+        val baseIntentField = taskInfoClass.getField("baseIntent")
+        val realActivityField = taskInfoClass.getField("realActivity")
+        val component = ComponentName(info.packageName, info.targetActivity ?: info.name)
+        val matching = tasks.filter { task ->
+            realActivityField.get(task) == component || (baseIntentField.get(task) as Intent).component == component
+        }
+        val owned = matching.firstOrNull { displayField.getInt(it) == displayId }
+        val independent = info.launchMode in setOf(ActivityInfo.LAUNCH_MULTIPLE, ActivityInfo.LAUNCH_SINGLE_TOP, ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK) &&
+            info.documentLaunchMode != ActivityInfo.DOCUMENT_LAUNCH_NEVER
+        // Android 16 跨显示器只选 component/document 的 ideal task，不跨屏选 affinity candidate。
+        if (!independent && matching.any { displayField.getInt(it) != displayId }) return 4
+        // 2. 优先复用 owned VD 的精确 launcher task；新实例明确使用 MULTIPLE_TASK。
+        val launch = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
+        if (owned != null) {
+            options.javaClass.getMethod("setLaunchTaskId", Int::class.javaPrimitiveType).invoke(options, idField.getInt(owned))
+        } else if (independent) {
+            launch.addFlags(Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+        }
+        val start = taskManager.javaClass.methods.first { it.name == "startActivityAsUser" && it.parameterTypes.size == 12 }
+        val result = start.invoke(
+            taskManager, null, ShellContext.SHELL_PACKAGE, null, launch, launch.resolveTypeIfNeeded(context.contentResolver), null, null,
+            0, 0, null, options.toBundle(), -2,
+        ) as Int
+        // Android 16 ActivityManager.isStartResultSuccessful；100+ 是非致命启动错误。
+        return if (result in 0..99) 0 else 3
+    }
+
+    /** 只选择助手拥有的显示器上的当前任务，绝不从主屏按包名挑选。 */
+    override fun topTaskId(sourceDisplayId: Int): Int {
+        if (synchronized(displays) { sourceDisplayId !in displays }) return -1
         return try {
-            val tasks = allTasks()
+            val displayField = taskInfoClass.getField("displayId")
+            val topField = taskInfoClass.getField("topActivity")
+            val task = allTasks().firstOrNull {
+                displayField.getInt(it) == sourceDisplayId && topField.get(it) != null
+            } ?: return -1
+            taskInfoClass.getField("taskId").getInt(task)
+        } catch (error: ReflectiveOperationException) {
+            Log.e(TAG, "topTaskId failed", error)
+            -1
+        } catch (error: SecurityException) {
+            Log.e(TAG, "topTaskId denied", error)
+            -1
+        }
+    }
+
+    /** 只移动记录的确切任务；已在目标可重复确认，第三屏或消失则拒绝。 */
+    override fun moveTaskById(taskId: Int, expectedSourceDisplayId: Int, targetDisplayId: Int): Boolean {
+        val sourceOwned = synchronized(displays) { expectedSourceDisplayId in displays }
+        val targetOwned = synchronized(displays) { targetDisplayId in displays }
+        if (!((sourceOwned && targetDisplayId == Display.DEFAULT_DISPLAY) ||
+                    (expectedSourceDisplayId == Display.DEFAULT_DISPLAY && targetOwned))) return false
+        return try {
             val idField = taskInfoClass.getField("taskId")
-            val target = tasks.firstOrNull { t ->
-                listOf("topActivity", "baseActivity").any { field ->
-                    (runCatching { taskInfoClass.getField(field).get(t) }.getOrNull() as? ComponentName)?.packageName == packageName
-                }
-            } ?: return false
-            val taskId = idField.getInt(target)
+            val task = allTasks().firstOrNull { idField.getInt(it) == taskId } ?: return false
+            val currentDisplay = taskInfoClass.getField("displayId").getInt(task)
+            if (currentDisplay == targetDisplayId) return true
+            if (currentDisplay != expectedSourceDisplayId) return false
             taskManager.javaClass.getMethod("moveRootTaskToDisplay", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                 .invoke(taskManager, taskId, targetDisplayId)
             true
-        } catch (_: Throwable) {
+        } catch (error: ReflectiveOperationException) {
+            Log.e(TAG, "moveTaskById failed", error)
+            false
+        } catch (error: SecurityException) {
+            Log.e(TAG, "moveTaskById denied", error)
             false
         }
     }
@@ -251,14 +314,13 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         null
     }
 
-    private fun allTasks(): List<Any> = try {
+    private fun allTasks(): List<Any> {
         val methods = taskManager.javaClass.methods.filter { it.name == "getTasks" }
         val m4 = methods.firstOrNull { it.parameterTypes.size == 4 }
-        val list = if (m4 != null) m4.invoke(taskManager, 50, false, false, Display.INVALID_DISPLAY)
-        else methods.first { it.parameterTypes.size == 3 }.invoke(taskManager, 50, false, false)
-        (list as? List<*>)?.filterNotNull().orEmpty()
-    } catch (_: Throwable) {
-        emptyList()
+        val list = if (m4 != null) m4.invoke(taskManager, Int.MAX_VALUE, false, false, Display.INVALID_DISPLAY)
+        else methods.first { it.parameterTypes.size == 3 }.invoke(taskManager, Int.MAX_VALUE, false, false)
+        @Suppress("UNCHECKED_CAST")
+        return list as List<Any>
     }
 
     override fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
@@ -349,6 +411,8 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     companion object {
         private const val TAG = "AkashicShellService"
+        // Display 的 TRUSTED、OWN_DISPLAY_GROUP、ALWAYS_UNLOCKED、OWN_FOCUS、STEAL_TOP_FOCUS_DISABLED。
+        private const val REQUIRED_DISPLAY_FLAGS = (1 shl 7) or (1 shl 8) or (1 shl 9) or (1 shl 11) or (1 shl 12)
         private const val KEEP_AWAKE_INTERVAL_MS = 4_000L
         private const val KEEP_AWAKE_LEASE_MS = 5 * 60_000L
     }
@@ -372,14 +436,27 @@ internal class DisplayPower {
         service!!.javaClass.getMethod("isDisplayInteractive", Int::class.javaPrimitiveType)
     }.getOrNull()
 
+    private val wakeMethod = runCatching {
+        service!!.javaClass.getMethod(
+            "wakeUpWithDisplayId", Long::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+            String::class.java, String::class.java, Int::class.javaPrimitiveType,
+        )
+    }.getOrNull()
+
     fun userActivity(displayId: Int) {
-        runCatching { userActivityMethod?.invoke(service, displayId, SystemClock.uptimeMillis(), 0, 0) }
-            .onFailure { Log.w("AkashicShellService", "userActivity($displayId) failed", it) }
+        checkNotNull(userActivityMethod) { "设备不支持按显示器上报用户活动" }
+            .invoke(service, displayId, SystemClock.uptimeMillis(), 0, 0)
     }
 
-    // 查询失败时按“醒着”处理，避免误判后反复重建虚拟屏
     fun isInteractive(displayId: Int): Boolean =
-        runCatching { interactiveMethod?.invoke(service, displayId) as? Boolean }.getOrNull() ?: true
+        checkNotNull(interactiveMethod) { "设备不支持查询显示器电源状态" }
+            .invoke(service, displayId) as Boolean
+
+    fun wakeUp(displayId: Int) {
+        checkNotNull(wakeMethod) { "设备不支持独立唤醒后台显示器，未唤醒主屏" }
+            .invoke(service, SystemClock.uptimeMillis(), 2, "akashic:phone-display", ShellContext.SHELL_PACKAGE, displayId)
+    }
+
 }
 
 object HelperMain {
@@ -392,8 +469,8 @@ object HelperMain {
         val appUid = args[1].toIntOrNull() ?: exitProcess(2)
         Looper.prepareMainLooper()
         val service = AkashicShellService(appUid)
-        service.enableAppAccessibility(packageName)
         deliverBinder(packageName, appUid, service)
+        service.enableAppAccessibility(packageName)
         Log.i(TAG, "HelperMain entered Looper.loop() for $packageName ($appUid)")
         Looper.loop()
     }
@@ -429,6 +506,10 @@ object HelperMain {
             }
             val caller = AttributionSource.Builder(Process.myUid()).setPackageName(ShellContext.SHELL_PACKAGE).build()
             val res = call.invoke(provider, caller, authority, "attach", null, extras) as? Bundle
+            if (res?.containsKey("accepted") == true && !res.getBoolean("accepted")) {
+                Log.i(TAG, "Existing helper kept; duplicate handoff rejected")
+                exitProcess(0)
+            }
             val appToken = res?.getBinder("token") ?: run {
                 Log.e(TAG, "provider.call returned null or missing token: $res")
                 exitProcess(0)
@@ -469,6 +550,7 @@ class HelperHandoffProvider : ContentProvider() {
 }
 
 object ShellHelperHub {
+    private const val TAG = "AkashicShellHub"
     private val appToken = Binder()
     @Volatile var shell: IAkashicShell? = null
         private set
@@ -476,36 +558,76 @@ object ShellHelperHub {
         private set
     @Volatile var pairingInProgress: Boolean = false
         private set
-    private var handoffLatch: CountDownLatch? = null
+    @Volatile private var handoffLatch: CountDownLatch? = null
+    private val startLock = Any()
+    private var startTask: FutureTask<Unit>? = null
 
+    /** 原子保留唯一活助手，拒绝的进程不获得 appToken。 */
     fun acceptBinder(binder: IBinder): Bundle {
         val iface = IAkashicShell.Stub.asInterface(binder)
-        runCatching {
-            binder.linkToDeath({
-                if (shell === iface) {
-                    shell = null
-                    statusText = "助手已断开"
+        val reply = Bundle().apply { putBoolean("accepted", false) }
+        var changed = false
+        synchronized(startLock) {
+            // 1. 活 owner 不被重复进程替换；只有确认死亡后才允许接替。
+            val current = shell
+            if (current != null && current.asBinder().isBinderAlive) return reply
+            if (current != null) {
+                shell = null
+                statusText = "助手已断开"
+                changed = true
+            }
+            val death = IBinder.DeathRecipient {
+                val cleared = synchronized(startLock) {
+                    if (shell !== iface) false else {
+                        shell = null
+                        statusText = "助手已断开"
+                        true
+                    }
+                }
+                if (cleared) {
                     ShellStatus.notifyChanged()
                     PhoneBridgeController.notifyStateChanged()
                 }
-            }, 0)
+            }
+            try {
+                binder.linkToDeath(death, 0)
+            } catch (error: RemoteException) {
+                Log.w(TAG, "Helper binder was already dead during handoff", error)
+                return@synchronized
+            }
+            if (!binder.isBinderAlive) {
+                Log.w(TAG, "Helper binder died during handoff")
+                return@synchronized
+            }
+            // 2. 与死亡清理共享短临界区，不让链接后的死亡回调错过本次发布。
+            shell = iface
+            statusText = "已激活 UID 2000 后台独立虚拟屏"
+            reply.putBoolean("accepted", true)
+            reply.putBinder("token", appToken)
+            handoffLatch?.countDown()
+            changed = true
         }
-        shell = iface
-        statusText = "已激活 UID 2000 后台独立虚拟屏"
-        handoffLatch?.countDown()
-        ShellStatus.notifyChanged()
-        PhoneBridgeController.notifyStateChanged()
-        return Bundle().apply {
-            putBoolean("accepted", true)
-            putBinder("token", appToken)
+        if (changed) {
+            ShellStatus.notifyChanged()
+            PhoneBridgeController.notifyStateChanged()
         }
+        return reply
     }
 
+    /** 多次同步只预留一个后台启动任务。 */
     fun tryAutoStartIfPaired(context: Context) {
-        if (shell != null) return
-        Thread({
-            runCatching { launchHelperOverAdb(context) }
-        }, "AkashicHelperAutoStart").start()
+        // 先预留启动任务，重复 sync 不再创建等待同一次启动的线程。
+        synchronized(startLock) {
+            if (shell != null || startTask != null) return
+            val task = newStart(context)
+            var started = false
+            try {
+                Thread({ runCatching { runStart(task) } }, "AkashicHelperAutoStart").start()
+                started = true
+            } finally {
+                if (!started) task.cancel(false)
+            }
+        }
     }
 
     fun pairAndStart(context: Context, rawCode: String, manualPort: Int?, onDone: (Boolean, String) -> Unit) {
@@ -541,8 +663,40 @@ object ShellHelperHub {
         }, "AkashicAdbPair").start()
     }
 
-    @SuppressLint("PrivateApi")
+    /** 配对与自动启动共享任务，等待不占用启动锁。 */
     fun launchHelperOverAdb(context: Context) {
+        val task = synchronized(startLock) {
+            if (shell != null) return
+            startTask ?: newStart(context)
+        }
+        // 发现、ADB 和 Binder 交接均在锁外，acceptBinder 可以正常完成交接。
+        runStart(task)
+    }
+
+    /** 调用方持有 startLock；FutureTask 只执行一次，所有入口共享结果。 */
+    private fun newStart(context: Context): FutureTask<Unit> {
+        val appContext = context.applicationContext
+        return object : FutureTask<Unit>({ startHelperOverAdb(appContext) }) {
+            override fun done() {
+                synchronized(startLock) {
+                    if (startTask === this) startTask = null
+                }
+            }
+        }.also { startTask = it }
+    }
+
+    /** 执行或加入同一次启动，并保留原始错误类型。 */
+    private fun runStart(task: FutureTask<Unit>) {
+        task.run()
+        try {
+            task.get()
+        } catch (error: ExecutionException) {
+            throw error.cause ?: error
+        }
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun startHelperOverAdb(context: Context) {
         if (shell != null) return
         val prefs = ShellPrefs(context)
         val candidates = LinkedHashSet<Int>()
@@ -574,7 +728,7 @@ object ShellHelperHub {
                     val apk = context.applicationInfo.sourceDir
                     val pkg = context.packageName
                     val uid = Process.myUid()
-                    val cmd = "(setprop service.adb.tcp.port 5555 >/dev/null 2>&1 || true; CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
+                    val cmd = "(CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)
                     }
