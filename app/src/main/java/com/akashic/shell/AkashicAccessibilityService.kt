@@ -7,6 +7,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -30,6 +31,7 @@ data class CapturedScreenshot(val png: ByteArray, val uptimeMs: Long)
 
 class AkashicAccessibilityService : AccessibilityService() {
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var lastUiEventUptimeMs: Long = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -37,7 +39,91 @@ class AkashicAccessibilityService : AccessibilityService() {
         ShellStatus.notifyChanged()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val type = event?.eventType ?: return
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+            type == AccessibilityEvent.TYPE_VIEW_SCROLLED ||
+            type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+        ) {
+            lastUiEventUptimeMs = SystemClock.uptimeMillis()
+        }
+    }
+
+    fun quietForMs(nowMs: Long = SystemClock.uptimeMillis()): Long {
+        val last = lastUiEventUptimeMs
+        return if (last <= 0L) Long.MAX_VALUE else (nowMs - last).coerceAtLeast(0L)
+    }
+
+    /** 轻量计算目标显示器的可见节点树 FNV-1a 64-bit 指纹，用于动态等待稳定性。 */
+    fun screenSignature(targetDisplayId: Int): ScreenFingerprint {
+        val roots = ArrayList<AccessibilityNodeInfo>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val byDisplay = windowsOnAllDisplays
+            val list = byDisplay.get(targetDisplayId)
+                ?: if (targetDisplayId == Display.DEFAULT_DISPLAY) byDisplay.get(Display.DEFAULT_DISPLAY) else null
+            if (list != null) {
+                for (win in list) {
+                    if (win.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
+                        win.type == AccessibilityWindowInfo.TYPE_SYSTEM ||
+                        win.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD
+                    ) {
+                        win.root?.let { roots.add(it) }
+                    }
+                }
+            }
+        }
+        if (roots.isEmpty() && targetDisplayId == Display.DEFAULT_DISPLAY) {
+            rootInActiveWindow?.let { roots.add(it) }
+        }
+
+        var hash = -3750763034362895579L // FNV-1a 64-bit offset basis
+        fun mix(v: Long) {
+            hash = (hash xor v) * 1099511628211L
+        }
+        fun mixStr(s: CharSequence?) {
+            if (s == null) {
+                mix(0L)
+                return
+            }
+            mix(s.length.toLong())
+            for (i in 0 until s.length) mix(s[i].code.toLong())
+        }
+
+        var count = 0
+        val rect = Rect()
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 48 || count >= 180) return
+            if (node.isVisibleToUser) {
+                node.getBoundsInScreen(rect)
+                val text = node.text
+                val desc = node.contentDescription
+                val clickable = node.isClickable
+                val editable = node.isEditable
+                val scrollable = node.isScrollable
+                if (rect.width() > 0 && rect.height() > 0 &&
+                    (!text.isNullOrEmpty() || !desc.isNullOrEmpty() || clickable || editable || scrollable)
+                ) {
+                    count++
+                    mixStr(node.packageName)
+                    mixStr(node.className)
+                    mixStr(text)
+                    mixStr(desc)
+                    mix(rect.left.toLong())
+                    mix(rect.top.toLong())
+                    mix(rect.right.toLong())
+                    mix(rect.bottom.toLong())
+                    if (node.isFocused) mix(1L)
+                }
+            }
+            val children = node.childCount
+            for (i in 0 until children) {
+                walk(node.getChild(i), depth + 1)
+            }
+        }
+        for (r in roots) walk(r, 0)
+        return ScreenFingerprint(hash = hash, nodeCount = count)
+    }
 
     override fun onInterrupt() {}
 
