@@ -653,17 +653,45 @@ object PhoneBridgeController {
                     }
                     val dispId = if (act == PhoneAction.HAND_TO_USER) virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
                     lap("awake")
+                    val a11yForWait = if (dispId > Display.DEFAULT_DISPLAY) AkashicAccessibilityService.instance else null
+                    val beforeFingerprint = a11yForWait?.screenSignature(dispId)
                     val generation = displayGeneration
                     val result = runAction(context, dispId, act, payload)
                     val textReadBack = result.text?.let { matchesText(it, dispId) } == true
                     lap("action")
                     val wantImg = payload.optBoolean("include_screenshot", false)
-                    val settleMs = when {
-                        act == PhoneAction.LAUNCH_APP -> 1_100L
-                        textReadBack && !wantImg -> 0L
-                        else -> 480L
+                    val waitSpec = when {
+                        act == PhoneAction.LAUNCH_APP -> ChangeWaitSpec.LAUNCH
+                        act == PhoneAction.WAIT -> {
+                            val explicitMs = payload.optInt("duration_ms", 480).toLong().coerceIn(10L, 10_000L)
+                            SystemClock.sleep(explicitMs)
+                            timing.put("settle_ms", explicitMs)
+                            null
+                        }
+                        textReadBack && !wantImg -> {
+                            timing.put("settle_ms", 0L)
+                            null
+                        }
+                        else -> ChangeWaitSpec.DEFAULT
                     }
-                    SystemClock.sleep(settleMs)
+                    if (waitSpec != null) {
+                        if (a11yForWait != null && beforeFingerprint != null) {
+                            val waitRes = ChangeWait.awaitStableChange(
+                                before = beforeFingerprint,
+                                spec = waitSpec,
+                                requireNonEmpty = act == PhoneAction.LAUNCH_APP,
+                                nowMs = { SystemClock.uptimeMillis() },
+                                sleepMs = { ms -> SystemClock.sleep(ms) },
+                                quietForMs = { now -> a11yForWait.quietForMs(now) },
+                                readFingerprint = { a11yForWait.screenSignature(dispId) },
+                            )
+                            timing.put("settle_ms", waitRes.waitedMs)
+                            timing.put("settled", waitRes.settled)
+                        } else {
+                            SystemClock.sleep(waitSpec.capMs)
+                            timing.put("settle_ms", waitSpec.capMs)
+                        }
+                    }
                     result.text?.let { text ->
                         check(matchesText(text, dispId)) {
                             "PHONE_INPUT_NOT_CONFIRMED: 未能在原后台输入框读回完整目标值；内容可能已部分改变，请重新观察，不要直接重试"
@@ -671,7 +699,7 @@ object PhoneBridgeController {
                     }
                     var captured = buildScreenObject(context, dispId, wantImg)
                     if (act == PhoneAction.LAUNCH_APP && (captured.json.optJSONArray("nodes")?.length() ?: 0) == 0) {
-                        SystemClock.sleep(800L)
+                        SystemClock.sleep(500L)
                         captured = buildScreenObject(context, dispId, wantImg)
                     }
                     val screen = publishScreen(owner, requestId, dispId, generation, captured)
