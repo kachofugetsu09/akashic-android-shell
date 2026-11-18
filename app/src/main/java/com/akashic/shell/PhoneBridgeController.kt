@@ -390,6 +390,7 @@ object PhoneBridgeController {
             .put("supports_connection_id", true)
             .put("supports_snapshot_ref", true)
             .put("supports_tree_v2", true)
+            .put("supports_apps", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -705,6 +706,7 @@ object PhoneBridgeController {
                         JSONObject().put("message", result.message).put("screen", screen),
                     ).put("state", currentStateJson(context))
                 }
+                "apps" -> response.put("ok", true).put("result", JSONObject().put("apps", launcherApps(context)))
                 "finish" -> {
                     val finalPreview = releaseVirtualDisplay()
                     updatePip(PipMode.DONE, "已完成", finalPreview)
@@ -749,11 +751,12 @@ object PhoneBridgeController {
                 advanceFrameWatermark()
                 val code = target.startApp(dispId, pkg)
                 if (code == 2) error("手机上未找到可启动的应用: $pkg")
-                if (code == 4) error("该应用无法证明可安全创建独立实例，请用户显式移交")
-                check(code == 0) { "后台虚拟屏启动 $pkg 失败 (code=$code)" }
+                if (code == 4) error("PHONE_APP_IN_USE: $pkg 正显示在手机主屏（用户可能在用）或被其他显示器占用，后台不抢；请稍后重试，或请用户移交")
+                check(code == 0 || code == 5) { "后台虚拟屏启动 $pkg 失败 (code=$code)" }
                 synchronized(this) { activePackages.add(pkg) }
                 updatePip(PipMode.RUNNING, "后台运行 $pkg", null)
-                "已向后台显示器 (#$dispId) 提交启动应用 $pkg 的请求"
+                if (code == 5) "已把主屏后台的 $pkg 借到后台显示器 (#$dispId) 继续使用；收尾时归还主屏"
+                else "已向后台显示器 (#$dispId) 提交启动应用 $pkg 的请求"
             }
             PhoneAction.TAP -> {
                 val element = targetElement(dispId, payload, TargetUse.TAP)
@@ -904,6 +907,22 @@ object PhoneBridgeController {
         return captured.json
     }
 
+    /** 桌面可启动应用的名称与包名，名称随手机语言，供 Agent 按名字打开应用。 */
+    private fun launcherApps(context: Context): JSONArray {
+        val pm = context.packageManager
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val labels = LinkedHashMap<String, String>()
+        @Suppress("DEPRECATION")
+        for (info in pm.queryIntentActivities(intent, 0)) {
+            val pkg = info.activityInfo?.packageName ?: continue
+            if (pkg == context.packageName || pkg in labels) continue
+            labels[pkg] = info.loadLabel(pm).toString().trim().ifEmpty { pkg }
+        }
+        return JSONArray().apply {
+            labels.entries.sortedBy { it.value }.forEach { put(JSONObject().put("label", it.value).put("package", it.key)) }
+        }
+    }
+
     private fun freshTree(displayId: Int): ScreenTree {
         val a11y = checkNotNull(AkashicAccessibilityService.instance) { "无障碍服务未连接，无法读取后台界面" }
         return a11y.dumpScreen(displayId, refRegistry).tree
@@ -974,8 +993,8 @@ object PhoneBridgeController {
         val target = checkNotNull(shell) { "后台助手未连接" }
         advanceFrameWatermark()
         val code = target.startIntent(displayId, intent)
-        check(code != 4) { "目标主屏任务无法安全创建独立实例，请用户显式移交" }
-        check(code == 0) { "后台目标无法启动 (code=$code)" }
+        check(code != 4) { "PHONE_APP_IN_USE: 目标应用正显示在手机主屏（用户可能在用）或被其他显示器占用，后台不抢；请稍后重试，或请用户移交" }
+        check(code == 0 || code == 5) { "后台目标无法启动 (code=$code)" }
     }
 
     private fun appKeyCode(key: String): Int {
