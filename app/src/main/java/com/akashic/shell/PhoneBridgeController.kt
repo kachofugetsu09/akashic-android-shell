@@ -694,8 +694,11 @@ object PhoneBridgeController {
                             "PHONE_INPUT_NOT_CONFIRMED: 未能在原后台输入框读回完整目标值；内容可能已部分改变，请重新观察，不要直接重试"
                         }
                     }
-                    if (act == PhoneAction.LAUNCH_APP && a11yForWait?.screenSignature(dispId)?.nodeCount == 0) {
-                        SystemClock.sleep(500L)
+                    // 启动应用或跳转新页面时无障碍树可能还没出来；空树最多再等 1.5 秒，避免拍到空白、白传截图。
+                    val emptyDeadline = SystemClock.uptimeMillis() + 1_500L
+                    while (act != PhoneAction.HAND_TO_USER && a11yForWait?.screenSignature(dispId)?.nodeCount == 0 &&
+                        SystemClock.uptimeMillis() < emptyDeadline) {
+                        SystemClock.sleep(150L)
                     }
                     // 截图只在需要时附上：显式要求、树为空或过稀、动作后界面没有变化。
                     val captured = buildScreenObject(context, dispId, wantImg, payload.optBoolean("auto_screenshot", false), unchanged)
