@@ -91,6 +91,9 @@ internal class ShellContext private constructor(base: Context) : ContextWrapper(
 class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     private val context: Context = ShellContext.create()
     private val displays = HashMap<Int, VirtualDisplay>()
+    // 显示器 id → 从主屏借来的任务；释放显示器前归还主屏。由 displays 锁保护。
+    private val borrowedTasks = HashMap<Int, LinkedHashSet<Int>>()
+    private val lifecycle = Any()
 
     @SuppressLint("PrivateApi")
     private val displayManager: DisplayManager =
@@ -204,15 +207,23 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     override fun releaseDisplay(displayId: Int) {
-        synchronized(awakeLeases) { awakeLeases.remove(displayId) }
-        val vd = synchronized(displays) { displays.remove(displayId) }
-        vd?.release()
+        synchronized(lifecycle) {
+            runCatching { returnBorrowed(displayId) }.onFailure { Log.w(TAG, "return borrowed failed", it) }
+            synchronized(awakeLeases) { awakeLeases.remove(displayId) }
+            val vd = synchronized(displays) { displays.remove(displayId) }
+            vd?.release()
+        }
     }
 
     override fun releaseAll() {
-        synchronized(awakeLeases) { awakeLeases.clear() }
-        val all = synchronized(displays) { displays.values.toList().also { displays.clear() } }
-        all.forEach { runCatching { it.release() } }
+        synchronized(lifecycle) {
+            synchronized(displays) { borrowedTasks.keys.toList() }.forEach { id ->
+                runCatching { returnBorrowed(id) }.onFailure { Log.w(TAG, "return borrowed failed", it) }
+            }
+            synchronized(awakeLeases) { awakeLeases.clear() }
+            val all = synchronized(displays) { displays.values.toList().also { displays.clear() } }
+            all.forEach { runCatching { it.release() } }
+        }
     }
 
     override fun destroy() {
@@ -226,7 +237,10 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     /** 在所属显示器启动目标，保留主屏现有任务。 */
-    override fun startIntent(displayId: Int, intent: Intent): Int {
+    // 启动、登记借用与归还、释放共用一把锁，连接断开时的 releaseAll 不会漏掉刚借来的任务。
+    override fun startIntent(displayId: Int, intent: Intent): Int = synchronized(lifecycle) { startIntentLocked(displayId, intent) }
+
+    private fun startIntentLocked(displayId: Int, intent: Intent): Int {
         if (synchronized(displays) { displayId !in displays }) return 3
         // 1. 解析实际 Activity，并查询实时任务归属，不能用包名的第一个任务代替 owner。
         val info = context.packageManager.resolveActivity(intent, 0)?.activityInfo ?: return 2
@@ -242,8 +256,15 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         val owned = matching.firstOrNull { displayField.getInt(it) == displayId }
         val independent = info.launchMode in setOf(ActivityInfo.LAUNCH_MULTIPLE, ActivityInfo.LAUNCH_SINGLE_TOP, ActivityInfo.LAUNCH_SINGLE_INSTANCE_PER_TASK) &&
             info.documentLaunchMode != ActivityInfo.DOCUMENT_LAUNCH_NEVER
-        // Android 16 跨显示器只选 component/document 的 ideal task，不跨屏选 affinity candidate。
-        if (!independent && matching.any { displayField.getInt(it) != displayId }) return 4
+        // Android 16 跨显示器只选 component/document 的 ideal task，会把同一任务原样搬到目标显示器。
+        // 只借主屏后台的那一个任务；主屏正显示（用户在用）或在别的显示器上则拒绝。
+        val elsewhere = matching.filter { displayField.getInt(it) != displayId }
+        var borrowedTask: Int? = null
+        if (owned == null && !independent && elsewhere.isNotEmpty()) {
+            val task = elsewhere.singleOrNull()
+                ?.takeIf { displayField.getInt(it) == Display.DEFAULT_DISPLAY && !isTaskVisible(it) } ?: return 4
+            borrowedTask = idField.getInt(task)
+        }
         // 2. 优先复用 owned VD 的精确 launcher task；新实例明确使用 MULTIPLE_TASK。
         val launch = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
@@ -258,7 +279,47 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
             0, 0, null, options.toBundle(), -2,
         ) as Int
         // Android 16 ActivityManager.isStartResultSuccessful；100+ 是非致命启动错误。
-        return if (result in 0..99) 0 else 3
+        if (result !in 0..99) return 3
+        val borrowed = borrowedTask ?: return 0
+        // 核对任务确实到了后台显示器；没搬过去就不能声称成功。
+        val landed = allTasks().firstOrNull { idField.getInt(it) == borrowed }?.let { displayField.getInt(it) }
+        if (landed != displayId) {
+            Log.w(TAG, "borrowed task $borrowed landed on display $landed")
+            return 3
+        }
+        synchronized(displays) { borrowedTasks.getOrPut(displayId) { LinkedHashSet() }.add(borrowed) }
+        return 5
+    }
+
+    private fun isTaskVisible(task: Any): Boolean = try {
+        taskInfoClass.getField("isVisible").getBoolean(task)
+    } catch (_: ReflectiveOperationException) {
+        // 读不到可见性时按正在显示处理，宁可拒绝也不抢用户屏幕。
+        true
+    }
+
+    // 1. 记下主屏当前前台 2. 逐个把仍在后台屏的借用任务移回主屏
+    // 3. 只有主屏顶部仍是刚搬回的任务时才恢复原前台；用户期间切换过就不动。
+    private fun returnBorrowed(displayId: Int) {
+        val ids = synchronized(displays) { borrowedTasks.remove(displayId) } ?: return
+        val displayField = taskInfoClass.getField("displayId")
+        val idField = taskInfoClass.getField("taskId")
+        fun mainTop(): Int? = allTasks().firstOrNull { displayField.getInt(it) == Display.DEFAULT_DISPLAY && isTaskVisible(it) }
+            ?.let { idField.getInt(it) }
+        val before = runCatching { mainTop() }.getOrNull()
+        val move = taskManager.javaClass.getMethod("moveRootTaskToDisplay", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+        val moved = ids.filter { id ->
+            runCatching {
+                val onDisplay = allTasks().any { idField.getInt(it) == id && displayField.getInt(it) == displayId }
+                if (onDisplay) move.invoke(taskManager, id, Display.DEFAULT_DISPLAY)
+                onDisplay
+            }.onFailure { Log.w(TAG, "return borrowed task $id failed", it) }.getOrDefault(false)
+        }
+        if (before == null || before in moved || runCatching { mainTop() }.getOrNull() !in moved) return
+        runCatching {
+            taskManager.javaClass.methods.first { it.name == "moveTaskToFront" && it.parameterTypes.size == 5 }
+                .invoke(taskManager, null, ShellContext.SHELL_PACKAGE, before, 0, null)
+        }.onFailure { Log.w(TAG, "restore main foreground failed", it) }
     }
 
     /** 只选择助手拥有的显示器上的当前任务，绝不从主屏按包名挑选。 */
