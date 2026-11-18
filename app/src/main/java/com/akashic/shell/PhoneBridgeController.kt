@@ -891,8 +891,10 @@ object PhoneBridgeController {
     /** 只把原后台节点的实时全文当作输入确认，hint 标志明确表示空输入。 */
     private fun matchesText(change: TextChange, displayId: Int): Boolean {
         val target = change.target
-        return target.refresh() && target.isVisibleToUser && target.window?.displayId == displayId &&
-            (if (target.isShowingHintText) "" else target.text?.toString()) == change.value
+        if (!target.refresh() || !target.isVisibleToUser || target.window?.displayId != displayId) return false
+        val shown = if (target.isShowingHintText) "" else target.text?.toString().orEmpty()
+        // 部分应用的输入框会在读回文字前加上标签（如小红书 "搜索, 咖啡拉花"），结尾一致即视为写入成功。
+        return shown == change.value || (change.value.isNotEmpty() && shown.endsWith(change.value))
     }
 
     /** 只发布本次 RPC 的最终树；编号由 RefRegistry 跨快照保持，动作时按身份核对。 */
@@ -1247,7 +1249,7 @@ object PhoneBridgeController {
         val screenshotReason = when {
             includeScreenshot -> "requested"
             !autoScreenshot -> null
-            tree == null || tree.namedCount < SPARSE_TREE_NAMES -> "sparse_tree"
+            tree == null || tree.namedCount < SPARSE_TREE_NAMES || tree.blankCount > tree.namedCount -> "sparse_tree"
             unchanged -> "no_change"
             else -> null
         }
