@@ -43,12 +43,14 @@ object PhoneBridgeController {
     private const val REPLY_ATTEMPTS = 3
     private const val RPC_WAKE_LOCK_MS = 120_000L
     private const val PREVIEW_INTERVAL_MS = 500L
+    private const val SPARSE_TREE_NAMES = 3
     private val BACKOFF_MS = longArrayOf(1_000, 2_000, 5_000, 10_000, 30_000)
 
     private enum class PhoneAction {
         LAUNCH_APP, TAP, TYPE_TEXT, CLEAR_TEXT, SCROLL, SWIPE, BACK, PRESS_KEY,
         OPEN_LINK, SHARE_TEXT, HAND_TO_USER, RESUME_FROM_USER, WAIT,
     }
+    private val NO_CHANGE_SCREENSHOT = setOf(PhoneAction.TAP, PhoneAction.SWIPE, PhoneAction.SCROLL, PhoneAction.BACK, PhoneAction.PRESS_KEY)
 
     private data class ConnectionOwner(val server: String, val connectionId: String)
 
@@ -84,16 +86,12 @@ object PhoneBridgeController {
     private var imageReader: ImageReader? = null
     private var localVirtualDisplay: VirtualDisplay? = null
     private val activePackages = LinkedHashSet<String>()
-    private data class NodeSnapshot(
-        val ref: String,
-        val owner: ConnectionOwner,
-        val displayId: Int,
-        val displayGeneration: Any,
-        val nodes: Map<Int, AccessibilityNodeInfo>,
-    )
-    private data class CapturedScreen(val json: JSONObject, val nodes: Map<Int, AccessibilityNodeInfo>)
+    private data class CapturedScreen(val json: JSONObject, val elements: Map<Int, ScreenElement>)
+    private enum class TargetUse { TAP, EDIT, SCROLL }
+    private val refRegistry = RefRegistry()
 
-    @Volatile private var nodeSnapshot: NodeSnapshot? = null
+    // 发布给插件过的编号；Shell 重启后为空，旧对话里的裸编号不会被新控件重新获得含义。
+    private val publishedRefs: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     @Volatile private var displayGeneration = Any()
     // 虚拟屏最新一帧（行宽含 stride 填充）；截图按需编码，不在每帧上编码整屏 PNG。
     private val frameLock = Any()
@@ -348,7 +346,8 @@ object PhoneBridgeController {
             displayThread = null
             displayHandler = null
             activePackages.clear()
-            nodeSnapshot = null
+            refRegistry.forgetNodes()
+            publishedRefs.clear()
             displayGeneration = Any()
             takeoverReason = null
             handedTaskId = null
@@ -390,6 +389,7 @@ object PhoneBridgeController {
             .put("supports_ack", true)
             .put("supports_connection_id", true)
             .put("supports_snapshot_ref", true)
+            .put("supports_tree_v2", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -470,7 +470,6 @@ object PhoneBridgeController {
                                     synchronized(this) {
                                         if (runToken !== token || activeConnection !== conn) return false
                                         owner = ConnectionOwner(server, id)
-                                        nodeSnapshot = null
                                         activeOwner = owner
                                         connectionError = null
                                     }
@@ -499,7 +498,6 @@ object PhoneBridgeController {
         } finally {
             synchronized(this) {
                 if (activeOwner === owner) {
-                    nodeSnapshot = null
                     activeOwner = null
                 }
                 if (activeConnection === conn) activeConnection = null
@@ -637,7 +635,7 @@ object PhoneBridgeController {
                     updatePip(if (takeoverReason != null) PipMode.NEEDS_YOU else PipMode.RUNNING, "正在观察屏幕", null)
                     val wantImg = payload.optBoolean("include_screenshot", false)
                     val generation = displayGeneration
-                    val captured = buildScreenObject(context, dispId, wantImg)
+                    val captured = buildScreenObject(context, dispId, wantImg, payload.optBoolean("auto_screenshot", false), false)
                     val screen = publishScreen(owner, requestId, dispId, generation, captured)
                     lap("screen")
                     response.put("ok", true).put("result", screen).put("state", currentStateJson(context))
@@ -646,10 +644,6 @@ object PhoneBridgeController {
                     val act = readAction(payload)
                     if (act == PhoneAction.RESUME_FROM_USER) {
                         check(takeoverReason != null) { "当前没有用户接管等待，未移动任何任务" }
-                    }
-                    if (act == PhoneAction.TYPE_TEXT || act == PhoneAction.CLEAR_TEXT ||
-                        (act == PhoneAction.TAP && !payload.isNull("node_id") && payload.has("node_id"))) {
-                        checkNodeSnapshot(owner, payload)
                     }
                     val dispId = if (act == PhoneAction.HAND_TO_USER) virtualDisplayId ?: Display.INVALID_DISPLAY else ensureAwakeDisplay(context)
                     lap("awake")
@@ -660,6 +654,7 @@ object PhoneBridgeController {
                     val textReadBack = result.text?.let { matchesText(it, dispId) } == true
                     lap("action")
                     val wantImg = payload.optBoolean("include_screenshot", false)
+                    var unchanged = false
                     val waitSpec = when {
                         act == PhoneAction.LAUNCH_APP -> ChangeWaitSpec.LAUNCH
                         act == PhoneAction.WAIT -> {
@@ -687,6 +682,7 @@ object PhoneBridgeController {
                             )
                             timing.put("settle_ms", waitRes.waitedMs)
                             timing.put("settled", waitRes.settled)
+                            unchanged = !waitRes.changed && act in NO_CHANGE_SCREENSHOT
                         } else {
                             SystemClock.sleep(waitSpec.capMs)
                             timing.put("settle_ms", waitSpec.capMs)
@@ -697,11 +693,11 @@ object PhoneBridgeController {
                             "PHONE_INPUT_NOT_CONFIRMED: 未能在原后台输入框读回完整目标值；内容可能已部分改变，请重新观察，不要直接重试"
                         }
                     }
-                    var captured = buildScreenObject(context, dispId, wantImg)
-                    if (act == PhoneAction.LAUNCH_APP && (captured.json.optJSONArray("nodes")?.length() ?: 0) == 0) {
+                    if (act == PhoneAction.LAUNCH_APP && a11yForWait?.screenSignature(dispId)?.nodeCount == 0) {
                         SystemClock.sleep(500L)
-                        captured = buildScreenObject(context, dispId, wantImg)
                     }
+                    // 截图只在需要时附上：显式要求、树为空或过稀、动作后界面没有变化。
+                    val captured = buildScreenObject(context, dispId, wantImg, payload.optBoolean("auto_screenshot", false), unchanged)
                     val screen = publishScreen(owner, requestId, dispId, generation, captured)
                     lap("screen")
                     response.put("ok", true).put(
@@ -726,7 +722,6 @@ object PhoneBridgeController {
                 else -> error("未知端侧操作: $op")
             }
         } catch (t: Throwable) {
-            nodeSnapshot = null
             response.put("ok", false).put("error", t.message ?: t.javaClass.simpleName)
         } finally {
             effectLock.unlock()
@@ -761,13 +756,12 @@ object PhoneBridgeController {
                 "已向后台显示器 (#$dispId) 提交启动应用 $pkg 的请求"
             }
             PhoneAction.TAP -> {
-                val nodeId = payload.optInt("node_id", -1)
+                val element = targetElement(dispId, payload, TargetUse.TAP)
                 val x: Int
                 val y: Int
-                if (nodeId > 0) {
-                    val node = nodeForAction(dispId, nodeId)
+                if (element != null) {
                     val bounds = Rect()
-                    node.getBoundsInScreen(bounds)
+                    element.node.getBoundsInScreen(bounds)
                     x = bounds.centerX()
                     y = bounds.centerY()
                 } else {
@@ -776,17 +770,16 @@ object PhoneBridgeController {
                 }
                 advanceFrameWatermark()
                 check(sh != null && sh.injectTap(dispId, x, y)) { "后台点击未被接受，请重新观察屏幕" }
-                updatePip(PipMode.RUNNING, "点击 ($x, $y)", null)
-                "已在后台显示器点击 ($x, $y)"
+                updatePip(PipMode.RUNNING, element?.let { "点击 ${it.name.take(12)}" } ?: "点击 ($x, $y)", null)
+                element?.let { "已点击 @${it.ref} ${it.role} \"${it.name}\"" } ?: "已在后台显示器点击 ($x, $y)"
             }
             PhoneAction.TYPE_TEXT, PhoneAction.CLEAR_TEXT -> {
                 val text = if (action == PhoneAction.CLEAR_TEXT) "" else payload.getString("text")
-                val nodeId = payload.optInt("node_id", -1)
-                val id = if (nodeId > 0) nodeId else checkNotNull(nodeSnapshot).nodes.entries.firstOrNull {
-                    it.value.isEditable && it.value.isFocused
-                }?.key ?: error("当前没有聚焦输入框，请观察并指定 node_id")
-                val target = nodeForAction(dispId, id)
-                check(target.isEditable) { "目标不是可编辑输入框" }
+                val element = targetElement(dispId, payload, TargetUse.EDIT)
+                    ?: freshTree(dispId).elements.values.firstOrNull { it.editable && it.node.isFocused && isLive(it, dispId) }
+                    ?: error("当前没有聚焦输入框，请用 @编号或输入框文字指定目标")
+                val target = element.node
+                check(target.isEditable) { "@${element.ref} ${element.role} \"${element.name}\" 不是输入框，请指定输入框本身" }
                 check(a11y != null && run { advanceFrameWatermark(); a11y.setNodeText(target, text) }) {
                     "输入框拒绝 ACTION_SET_TEXT；未覆盖用户剪贴板，请使用应用支持的输入方式"
                 }
@@ -796,6 +789,9 @@ object PhoneBridgeController {
             }
             PhoneAction.SCROLL -> {
                 val dir = payload.optString("direction", "down")
+                targetElement(dispId, payload, TargetUse.SCROLL)?.let { element ->
+                    return ActionResult(scrollElement(dispId, element, dir), null)
+                }
                 val geometry = ownedGeometry(context, dispId)
                 val cx = geometry.width / 2
                 val h = geometry.height
@@ -896,20 +892,7 @@ object PhoneBridgeController {
             (if (target.isShowingHintText) "" else target.text?.toString()) == change.value
     }
 
-    /** 先核对快照身份，再读取短编号；缺失引用不会借用最新快照。 */
-    private fun checkNodeSnapshot(owner: ConnectionOwner, payload: JSONObject) {
-        val ref = payload.opt("snapshot_ref")
-        require(ref is String && ref.isNotBlank()) {
-            "PHONE_SNAPSHOT_REF_REQUIRED: 节点操作必须携带 snapshot_ref，请升级 phone-use 至 0.3.0 并重新观察"
-        }
-        val snapshot = nodeSnapshot
-        check(snapshot != null && snapshot.ref == ref && snapshot.owner === owner &&
-            snapshot.displayId == virtualDisplayId && snapshot.displayGeneration === displayGeneration) {
-            "PHONE_SNAPSHOT_STALE: 快照已过期，未执行节点操作，请重新观察"
-        }
-    }
-
-    /** 只发布本次 RPC 的最终树，引用和节点映射共用一个不可变槽位。 */
+    /** 只发布本次 RPC 的最终树；编号由 RefRegistry 跨快照保持，动作时按身份核对。 */
     @Synchronized
     private fun publishScreen(owner: ConnectionOwner, requestId: String, displayId: Int,
                               generation: Any, captured: CapturedScreen): JSONObject {
@@ -917,20 +900,74 @@ object PhoneBridgeController {
             "PHONE_SNAPSHOT_STALE: 捕获期间连接或后台显示器已变化，请重新观察"
         }
         captured.json.put("snapshot_ref", requestId)
-        nodeSnapshot = if (displayId <= Display.DEFAULT_DISPLAY || captured.nodes.isEmpty()) null else
-            NodeSnapshot(requestId, owner, displayId, generation, captured.nodes)
+        publishedRefs.addAll(captured.elements.keys)
         return captured.json
     }
 
-    /** 节点必须仍可见且属于本次后台显示器，禁止用旧缓存操作用户主屏。 */
-    private fun nodeForAction(displayId: Int, nodeId: Int): AccessibilityNodeInfo {
-        val node = nodeSnapshot?.nodes?.get(nodeId) ?: error("PHONE_NODE_STALE: 节点不存在，请重新观察")
-        check(node.refresh()) { "PHONE_NODE_STALE: 节点已失效，请重新观察" }
-        check(node.window?.displayId == displayId && displayId > Display.DEFAULT_DISPLAY) {
-            "PHONE_WRONG_DISPLAY: 节点已离开后台显示器，未执行操作"
+    private fun freshTree(displayId: Int): ScreenTree {
+        val a11y = checkNotNull(AkashicAccessibilityService.instance) { "无障碍服务未连接，无法读取后台界面" }
+        return a11y.dumpScreen(displayId, refRegistry).tree
+    }
+
+    /** 节点必须仍可见、属于本次后台显示器且仍是同一个控件，禁止用旧缓存操作用户主屏。 */
+    private fun isLive(element: ScreenElement, displayId: Int): Boolean {
+        val node = element.node
+        return displayId > Display.DEFAULT_DISPLAY && node.refresh() && node.isVisibleToUser &&
+            node.window?.displayId == displayId && ScreenModel.ownKey(node) == element.ownKey
+    }
+
+    // 1. @编号必须是已发布过的 2. 动作前重读界面，同一编号意味着同一节点且名称等指纹未变 3. 语义定位要求唯一。
+    private fun targetElement(displayId: Int, payload: JSONObject, use: TargetUse): ScreenElement? {
+        val selector = readSelector(payload)
+        val ref = if (payload.has("node_id") && !payload.isNull("node_id")) payload.getInt("node_id") else null
+        if (selector == null && ref == null) return null
+        if (ref != null) {
+            check(ref in publishedRefs) {
+                "PHONE_NODE_STALE: @$ref 不是当前 Shell 发布过的编号（可能已重启），请重新观察"
+            }
+            val element = freshTree(displayId).elements[ref]?.takeIf { isLive(it, displayId) }
+            return checkNotNull(element) { "PHONE_NODE_STALE: @$ref 已不在当前界面或内容已变化，请按最新快照重新选择" }
         }
-        check(node.isVisibleToUser) { "PHONE_NODE_STALE: 节点已不可见，请重新观察" }
-        return node
+        val all = ScreenModel.matches(freshTree(displayId), checkNotNull(selector)).filter { isLive(it, displayId) }
+        val fitting = when (use) {
+            TargetUse.TAP -> all.filter { it.clickable }
+            TargetUse.EDIT -> all.filter { it.editable }
+            TargetUse.SCROLL -> all.filter { it.scrollable }
+        }.ifEmpty { all }
+        val described = selector.text?.let { "\"$it\"" } ?: "id=${selector.resourceId}"
+        check(fitting.isNotEmpty()) { "PHONE_TARGET_NOT_FOUND: 当前界面没有 $described，请看最新快照或先滚动" }
+        check(fitting.size == 1) {
+            "PHONE_TARGET_AMBIGUOUS: $described 匹配到 ${fitting.size} 个元素：" +
+                fitting.take(6).joinToString("；") { "@${it.ref} ${it.role} \"${it.name}\"" } + "，请改用 @编号"
+        }
+        return fitting.single()
+    }
+
+    private fun readSelector(payload: JSONObject): ScreenSelector? {
+        val raw = payload.optJSONObject("selector") ?: return null
+        fun field(name: String): String? = raw.optString(name).trim().takeIf { raw.has(name) && !raw.isNull(name) && it.isNotEmpty() }
+        return ScreenSelector(field("text"), raw.optBoolean("exact", false), field("resource_id"), field("role"))
+    }
+
+    private fun scrollElement(displayId: Int, element: ScreenElement, dir: String): String {
+        val a11y = AkashicAccessibilityService.instance
+        advanceFrameWatermark()
+        if (a11y != null && a11y.scrollNode(element.node, dir)) {
+            updatePip(PipMode.RUNNING, "滚动 ($dir)", null)
+            return "已滚动 @${element.ref} ${element.role} ($dir)"
+        }
+        // 控件不支持无障碍滚动时，在它自己的范围内滑动，不扫过整屏。
+        val r = Rect()
+        element.node.getBoundsInScreen(r)
+        val (x1, y1, x2, y2) = when (dir) {
+            "down" -> listOf(r.centerX(), r.top + r.height() * 3 / 4, r.centerX(), r.top + r.height() / 4)
+            "up" -> listOf(r.centerX(), r.top + r.height() / 4, r.centerX(), r.top + r.height() * 3 / 4)
+            "left" -> listOf(r.left + r.width() * 4 / 5, r.centerY(), r.left + r.width() / 5, r.centerY())
+            else -> listOf(r.left + r.width() / 5, r.centerY(), r.left + r.width() * 4 / 5, r.centerY())
+        }
+        val sh = ShellHelperHub.shell
+        check(sh != null && sh.injectSwipe(displayId, x1, y1, x2, y2, 320)) { "后台滚动未被接受" }
+        return "已在 @${element.ref} 范围内滑动 ($dir)"
     }
 
     private fun checkIntentStarted(shell: IAkashicShell?, displayId: Int, intent: Intent) {
@@ -973,10 +1010,17 @@ object PhoneBridgeController {
             require(value is Int && value in range) { "$name 必须是范围 $range 内的整数" }
         }
         if (payload.has("node_id") && !payload.isNull("node_id")) integer("node_id", 1..Int.MAX_VALUE)
+        if (payload.has("selector") && !payload.isNull("selector")) {
+            val selector = payload.optJSONObject("selector")
+            require(selector != null && readSelector(payload)?.let { it.text != null || it.resourceId != null } == true) {
+                "selector 必须包含非空 text 或 resource_id"
+            }
+        }
+        val targeted = (payload.has("node_id") && !payload.isNull("node_id")) || (payload.has("selector") && !payload.isNull("selector"))
         if (payload.has("package_name") && !payload.isNull("package_name")) string("package_name")
         when (action) {
             PhoneAction.LAUNCH_APP -> { string("package_name"); require(payload.getString("package_name").isNotBlank()) { "package_name 不能为空" } }
-            PhoneAction.TAP -> if (!payload.has("node_id") || payload.isNull("node_id")) { integer("x", 0..Int.MAX_VALUE); integer("y", 0..Int.MAX_VALUE) }
+            PhoneAction.TAP -> if (!targeted) { integer("x", 0..Int.MAX_VALUE); integer("y", 0..Int.MAX_VALUE) }
             PhoneAction.TYPE_TEXT -> { string("text"); require(payload.getString("text").isNotEmpty()) { "text 不能为空，请用 clear_text 清空" } }
             PhoneAction.SHARE_TEXT -> { string("text"); string("package_name"); require(payload.getString("package_name").isNotBlank() && payload.getString("text").isNotEmpty()) { "分享必须指定应用与非空文本" } }
             PhoneAction.SWIPE -> {
@@ -1169,11 +1213,25 @@ object PhoneBridgeController {
             ?: error("PHONE_FRAME_NOT_FRESH: 5秒内未取得动作水位之后的生产帧；未返回旧图，请重新观察")
     }
 
-    private fun buildScreenObject(context: Context, dispId: Int, includeScreenshot: Boolean): CapturedScreen {
+    private fun buildScreenObject(
+        context: Context,
+        dispId: Int,
+        includeScreenshot: Boolean,
+        autoScreenshot: Boolean,
+        unchanged: Boolean,
+    ): CapturedScreen {
         val sh = ShellHelperHub.shell
         val a11y = AkashicAccessibilityService.instance
         val geometry = if (dispId > Display.DEFAULT_DISPLAY) ownedGeometry(context, dispId) else DisplayGeometry(0, 0, 0)
-        val readout = if (dispId > Display.DEFAULT_DISPLAY) a11y?.dumpScreen(dispId) else null
+        val readout = if (dispId > Display.DEFAULT_DISPLAY) a11y?.dumpScreen(dispId, refRegistry) else null
+        val tree = readout?.tree
+        val screenshotReason = when {
+            includeScreenshot -> "requested"
+            !autoScreenshot -> null
+            tree == null || tree.namedCount < SPARSE_TREE_NAMES -> "sparse_tree"
+            unchanged -> "no_change"
+            else -> null
+        }
         val topComp = if (sh != null && dispId > 0) runCatching { sh.topActivity(dispId) }.getOrNull() else null
         val resolvedPkg = if (dispId > Display.DEFAULT_DISPLAY) {
             topComp?.substringBefore('/')?.takeIf { it.isNotEmpty() } ?: readout?.packageName.orEmpty()
@@ -1182,7 +1240,7 @@ object PhoneBridgeController {
             topComp?.substringAfter('/', "")?.takeIf { it.isNotEmpty() }.orEmpty()
         } else ""
 
-        val returnedPng = if (includeScreenshot && dispId > Display.DEFAULT_DISPLAY) {
+        val returnedPng = if (screenshotReason != null && dispId > Display.DEFAULT_DISPLAY) {
             val reader = ownedFrameReader(dispId)
             val natural = geometry.rotation == 0 && reader.width == geometry.width && reader.height == geometry.height
             if (natural) captureDisplayPng(dispId, a11y) else captureLogicalPng(dispId, a11y)
@@ -1197,13 +1255,17 @@ object PhoneBridgeController {
             .put("activity_name", resolvedAct)
             .put("pip_state", pipMode.id)
             .put("audio_muted", false)
-            .put("nodes", readout?.nodes ?: JSONArray())
+            .put("nodes", tree?.nodes ?: JSONArray())
+            .put("tree_version", 2)
+            .put("truncated", tree?.truncated ?: false)
+            .put("has_webview", tree?.hasWebView ?: false)
+            .put("screenshot_reason", screenshotReason ?: JSONObject.NULL)
             .put("takeover_reason", takeoverReason ?: JSONObject.NULL)
             .apply {
                 if (returnedPng != null && returnedPng.isNotEmpty()) {
                     put("screenshot_b64", Base64.encodeToString(returnedPng, Base64.NO_WRAP))
                 }
             }
-        return CapturedScreen(screen, readout?.nodeRefs ?: emptyMap())
+        return CapturedScreen(screen, tree?.elements ?: emptyMap())
     }
 }

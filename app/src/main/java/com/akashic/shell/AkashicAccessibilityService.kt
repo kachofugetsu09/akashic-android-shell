@@ -23,8 +23,7 @@ import java.util.concurrent.atomic.AtomicReference
 data class ScreenReadout(
     val displayId: Int,
     val packageName: String,
-    val nodes: JSONArray,
-    val nodeRefs: Map<Int, AccessibilityNodeInfo>,
+    val tree: ScreenTree,
 )
 
 data class CapturedScreenshot(val png: ByteArray, val uptimeMs: Long)
@@ -135,9 +134,7 @@ class AkashicAccessibilityService : AccessibilityService() {
     }
 
     /** 只读取本次目标显示器的应用身份，不借用其它显示器的历史事件。 */
-    fun dumpScreen(targetDisplayId: Int): ScreenReadout {
-        val nodeArray = JSONArray()
-        val refs = LinkedHashMap<Int, AccessibilityNodeInfo>()
+    fun dumpScreen(targetDisplayId: Int, registry: RefRegistry): ScreenReadout {
         val packages = LinkedHashSet<String>()
 
         val roots = ArrayList<AccessibilityNodeInfo>()
@@ -168,43 +165,8 @@ class AkashicAccessibilityService : AccessibilityService() {
             }
         }
 
-        var nextId = 1
-        val rect = Rect()
-
-        fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 48 || nextId > 180) return
-            if (node.isVisibleToUser) {
-                node.getBoundsInScreen(rect)
-                val text = node.text?.toString()?.trim().orEmpty()
-                val desc = node.contentDescription?.toString()?.trim().orEmpty()
-                val clickable = node.isClickable || node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_CLICK }
-                val editable = node.isEditable || node.className?.toString()?.contains("EditText") == true
-                val scrollable = node.isScrollable
-                if (rect.width() > 0 && rect.height() > 0 && (text.isNotEmpty() || desc.isNotEmpty() || clickable || editable || scrollable)) {
-                    val id = nextId++
-                    refs[id] = node
-                    val item = JSONObject()
-                        .put("node_id", id)
-                        .put("class_name", node.className?.toString() ?: "android.view.View")
-                        .put("text", text)
-                        .put("content_description", desc)
-                        .put("bounds", JSONArray().put(rect.left).put(rect.top).put(rect.right).put(rect.bottom))
-                        .put("clickable", clickable)
-                        .put("editable", editable)
-                        .put("scrollable", scrollable)
-                        .put("focused", node.isFocused || node.isAccessibilityFocused)
-                    if (node.isCheckable) item.put("checked", node.isChecked)
-                    nodeArray.put(item)
-                }
-            }
-            val count = node.childCount
-            for (i in 0 until count) {
-                traverse(node.getChild(i), depth + 1)
-            }
-        }
-
-        for (r in roots) traverse(r, 0)
-        return ScreenReadout(targetDisplayId, packages.singleOrNull().orEmpty(), nodeArray, refs)
+        val tree = ScreenModel.capture(roots, registry)
+        return ScreenReadout(targetDisplayId, packages.singleOrNull().orEmpty(), tree)
     }
 
     fun performTap(displayId: Int, x: Float, y: Float, durationMs: Long = 55L): Boolean {
@@ -274,6 +236,20 @@ class AkashicAccessibilityService : AccessibilityService() {
         if (!dispatched) return false
         latch.await(10, TimeUnit.SECONDS)
         return ok
+    }
+
+    /** 先用控件声明的方向滚动（列表、滚轮选择器），不支持时退回前后翻页动作。 */
+    fun scrollNode(node: AccessibilityNodeInfo, direction: String): Boolean {
+        val directional = when (direction) {
+            "up" -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_UP
+            "down" -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_DOWN
+            "left" -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_LEFT
+            else -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT
+        }
+        if (node.actionList.any { it.id == directional.id } && node.performAction(directional.id)) return true
+        val generic = if (direction == "down" || direction == "right") AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        return node.performAction(generic)
     }
 
     fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
