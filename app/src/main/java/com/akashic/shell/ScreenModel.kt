@@ -25,6 +25,8 @@ data class ScreenTree(
     val nodes: JSONArray,
     val elements: Map<Int, ScreenElement>,
     val namedCount: Int,
+    // 无文字的可操作元素（自绘网格、图标卡片），多于有名元素时需要看图。
+    val blankCount: Int,
     val truncated: Boolean,
     val hasWebView: Boolean,
 )
@@ -80,6 +82,7 @@ object ScreenModel {
         val out = JSONArray()
         val elements = LinkedHashMap<Int, ScreenElement>()
         var named = 0
+        var blank = 0
         var truncated = false
         var webView = false
         val rect = Rect()
@@ -111,7 +114,7 @@ object ScreenModel {
             val element = element(node, rect, name, clickable, editable, scrollable, registry)
             elements[element.ref] = element
             out.put(json(element, node, rect, depth))
-            if (name.isNotEmpty()) named++
+            if (name.isNotEmpty()) named++ else if (clickable) blank++
             // 折叠控件的文字已并入名称，只继续展开其中的可操作后代。
             if (folds) forEachChild(node) { visitActionable(it, depth + 1, level + 1, ::visit) }
             else forEachChild(node) { visit(it, depth + 1, level + 1) }
@@ -119,7 +122,7 @@ object ScreenModel {
 
         for (root in roots) visit(root, 0, 0)
         registry.commit()
-        return ScreenTree(out, elements, named, truncated, webView)
+        return ScreenTree(out, elements, named, blank, truncated, webView)
     }
 
     fun matches(tree: ScreenTree, selector: ScreenSelector): List<ScreenElement> {
