@@ -2,6 +2,7 @@ package com.akashic.shell
 
 import android.annotation.SuppressLint
 import android.app.ActivityOptions
+import android.app.AppOpsManager
 import android.app.Application
 import android.app.Instrumentation
 import android.content.AttributionSource
@@ -15,6 +16,12 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
 import android.database.Cursor
 import android.hardware.display.DisplayManager
+import android.media.MediaMetadata
+import android.media.session.MediaController
+import android.media.session.MediaSessionManager
+import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.HandlerThread
 import android.hardware.display.VirtualDisplay
 import android.net.Uri
 import android.os.Binder
@@ -37,6 +44,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import org.json.JSONObject
+import java.util.concurrent.Executors
 import kotlin.system.exitProcess
 
 internal class ShellContext private constructor(base: Context) : ContextWrapper(base) {
@@ -107,6 +116,15 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     private val power = DisplayPower()
     // displayId -> 保活租约到期时间（uptimeMillis）
     private val awakeLeases = HashMap<Int, Long>()
+    @Volatile private var eventSink: IAkashicEventSink? = null
+    private var observersStarted = false
+    private val observerLock = Any()
+    private var eventThread: HandlerThread? = null
+    private var eventHandler: Handler? = null
+    private var lastFgPackage: String? = null
+    private var lastFgEnteredMs: Long = 0L
+    private val mediaCallbacks = HashMap<String, Pair<MediaController, MediaController.Callback>>()
+    private val lastMediaState = HashMap<String, String>()
 
     init {
         Thread({ keepAwakeLoop() }, "AkashicKeepAwake").apply {
@@ -449,6 +467,250 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         false
     }
 
+    override fun registerEventSink(sink: IAkashicEventSink?) {
+        eventSink = sink
+        if (sink != null) {
+            ensurePrivilegedObservers()
+        }
+    }
+
+    private fun emitShellEvent(adapter: String, eventType: String, packageName: String, payload: JSONObject) {
+        val sink = eventSink ?: return
+        val frame = JSONObject()
+            .put("adapter", adapter)
+            .put("event_type", eventType)
+            .put("package_name", packageName)
+            .put("ts_ms", System.currentTimeMillis())
+            .put("payload", payload)
+        runCatching {
+            sink.onDeviceEvent(frame.toString())
+        }.onFailure {
+            Log.d(TAG, "eventSink delivery failed: ${it.message}")
+        }
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun ensurePrivilegedObservers() {
+        synchronized(observerLock) {
+            if (observersStarted) return
+            observersStarted = true
+            val ht = HandlerThread("AkashicShellEvents").apply { isDaemon = true; start() }
+            eventThread = ht
+            eventHandler = Handler(ht.looper)
+        }
+        startForegroundObservers()
+        startAppOpsObserver()
+        startMediaObserver()
+    }
+
+    @SuppressLint("PrivateApi")
+    private fun startForegroundObservers() {
+        val handler = eventHandler ?: return
+        val checkRunnable = Runnable { checkForegroundChange() }
+        fun scheduleCheck() {
+            handler.removeCallbacks(checkRunnable)
+            handler.postDelayed(checkRunnable, 150L)
+        }
+
+        // 1. ITaskStackListener (ActivityTaskManager)
+        runCatching {
+            val stubCls = Class.forName("android.app.ITaskStackListener\$Stub")
+            val desc = stubCls.getField("DESCRIPTOR").get(null) as String
+            val txMoved = runCatching { stubCls.getField("TRANSACTION_onTaskMovedToFront").getInt(null) }.getOrDefault(-1)
+            val txStack = runCatching { stubCls.getField("TRANSACTION_onTaskStackChanged").getInt(null) }.getOrDefault(-1)
+            val listener = object : Binder() {
+                override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                    if (code == INTERFACE_TRANSACTION) {
+                        reply?.writeString(desc)
+                        return true
+                    }
+                    if (code == txMoved || code == txStack) {
+                        runCatching { data.enforceInterface(desc) }
+                        scheduleCheck()
+                        return true
+                    }
+                    return super.onTransact(code, data, reply, flags)
+                }
+            }
+            val itf = Class.forName("android.app.ITaskStackListener")
+            taskManager.javaClass.getMethod("registerTaskStackListener", itf).invoke(taskManager, listener)
+            Log.i(TAG, "Registered ITaskStackListener")
+        }.onFailure {
+            Log.w(TAG, "registerTaskStackListener unavailable", it)
+        }
+
+        // 2. IProcessObserver (ActivityManager)
+        runCatching {
+            val am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null)!!
+            val stubCls = Class.forName("android.app.IProcessObserver\$Stub")
+            val desc = stubCls.getField("DESCRIPTOR").get(null) as String
+            val txFg = runCatching { stubCls.getField("TRANSACTION_onForegroundActivitiesChanged").getInt(null) }.getOrDefault(-1)
+            val observer = object : Binder() {
+                override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                    if (code == INTERFACE_TRANSACTION) {
+                        reply?.writeString(desc)
+                        return true
+                    }
+                    if (code == txFg) {
+                        runCatching { data.enforceInterface(desc) }
+                        scheduleCheck()
+                        return true
+                    }
+                    return super.onTransact(code, data, reply, flags)
+                }
+            }
+            val itf = Class.forName("android.app.IProcessObserver")
+            am.javaClass.getMethod("registerProcessObserver", itf).invoke(am, observer)
+            Log.i(TAG, "Registered IProcessObserver")
+        }.onFailure {
+            Log.w(TAG, "registerProcessObserver unavailable", it)
+        }
+    }
+
+    private fun checkForegroundChange() {
+        val compStr = topActivity(Display.DEFAULT_DISPLAY) ?: return
+        val pkg = compStr.substringBefore('/')
+        if (pkg.isEmpty() || pkg == lastFgPackage) return
+        val nowMs = System.currentTimeMillis()
+        val prevPkg = lastFgPackage
+        val prevEntered = lastFgEnteredMs
+        lastFgPackage = pkg
+        lastFgEnteredMs = nowMs
+
+        if (prevPkg != null && prevEntered > 0L && prevPkg != "com.android.systemui") {
+            val durationS = ((nowMs - prevEntered) / 1000L).toInt().coerceAtLeast(0)
+            emitShellEvent(
+                "foreground",
+                "app_session",
+                prevPkg,
+                JSONObject()
+                    .put("duration_s", durationS)
+                    .put("entered_at_ms", prevEntered)
+                    .put("exited_at_ms", nowMs)
+                    .put("source", "uid2000_observer"),
+            )
+        }
+        if (pkg != "com.android.systemui") {
+            emitShellEvent(
+                "foreground",
+                "app_foreground",
+                pkg,
+                JSONObject().put("activity_name", compStr).put("source", "uid2000_observer"),
+            )
+        }
+    }
+
+    private fun startAppOpsObserver() {
+        runCatching {
+            val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            val ops = arrayOf(
+                AppOpsManager.OPSTR_FINE_LOCATION,
+                AppOpsManager.OPSTR_CAMERA,
+                AppOpsManager.OPSTR_RECORD_AUDIO,
+            )
+            val exec = Executors.newSingleThreadExecutor { r -> Thread(r, "AkashicAppOps").apply { isDaemon = true } }
+            appOps.startWatchingActive(ops, exec, AppOpsManager.OnOpActiveChangedListener { op, _, pkg, active ->
+                if (pkg == "com.android.shell" || pkg == "com.akashic.shell" || pkg == "android" || pkg == "com.google.android.gms") return@OnOpActiveChangedListener
+                val shortOp = when (op) {
+                    AppOpsManager.OPSTR_FINE_LOCATION -> "FINE_LOCATION"
+                    AppOpsManager.OPSTR_CAMERA -> "CAMERA"
+                    AppOpsManager.OPSTR_RECORD_AUDIO -> "RECORD_AUDIO"
+                    else -> op
+                }
+                emitShellEvent(
+                    "appops",
+                    if (active) "op_start" else "op_stop",
+                    pkg,
+                    JSONObject().put("op", shortOp).put("active", active),
+                )
+            })
+            Log.i(TAG, "Registered AppOpsManager.startWatchingActive")
+        }.onFailure {
+            Log.w(TAG, "AppOps startWatchingActive unavailable", it)
+        }
+    }
+
+    private fun startMediaObserver() {
+        val handler = eventHandler ?: return
+        runCatching {
+            val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val listener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+                syncMediaControllers(controllers ?: emptyList())
+            }
+            msm.addOnActiveSessionsChangedListener(listener, null, handler)
+            syncMediaControllers(msm.getActiveSessions(null))
+            Log.i(TAG, "Registered MediaSessionManager listener")
+        }.onFailure {
+            Log.w(TAG, "MediaSessionManager listener unavailable", it)
+        }
+    }
+
+    private fun syncMediaControllers(controllers: List<MediaController>) {
+        val handler = eventHandler ?: return
+        val liveKeys = HashSet<String>()
+        for (controller in controllers) {
+            val pkg = controller.packageName ?: continue
+            val key = "$pkg:${controller.sessionToken}"
+            liveKeys.add(key)
+            if (!mediaCallbacks.containsKey(key)) {
+                val cb = object : MediaController.Callback() {
+                    override fun onPlaybackStateChanged(state: PlaybackState?) {
+                        reportMediaController(controller)
+                    }
+                    override fun onMetadataChanged(metadata: MediaMetadata?) {
+                        reportMediaController(controller)
+                    }
+                }
+                runCatching {
+                    controller.registerCallback(cb, handler)
+                    mediaCallbacks[key] = controller to cb
+                    reportMediaController(controller)
+                }
+            }
+        }
+        val iter = mediaCallbacks.entries.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (entry.key !in liveKeys) {
+                runCatching { entry.value.first.unregisterCallback(entry.value.second) }
+                iter.remove()
+            }
+        }
+    }
+
+    private fun reportMediaController(controller: MediaController) {
+        val pkg = controller.packageName ?: return
+        val pbState = controller.playbackState?.state ?: PlaybackState.STATE_NONE
+        val stateLabel = when (pbState) {
+            PlaybackState.STATE_PLAYING -> "playing"
+            PlaybackState.STATE_PAUSED -> "paused"
+            PlaybackState.STATE_STOPPED -> "stopped"
+            else -> return
+        }
+        val meta = controller.metadata
+        val title = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim().orEmpty()
+        val artist = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim().orEmpty()
+        val album = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim().orEmpty()
+        val sig = "$stateLabel|$title|$artist|$album"
+        if (lastMediaState[pkg] == sig) return
+        lastMediaState[pkg] = sig
+        emitShellEvent(
+            "media",
+            "media_$stateLabel",
+            pkg,
+            JSONObject()
+                .put("state", stateLabel)
+                .put("title", title)
+                .put("artist", artist)
+                .put("album", album),
+        )
+    }
+
+    fun enableEventPermissions(packageName: String) {
+        execCmd("/system/bin/cmd", "notification", "allow_listener", "$packageName/$packageName.AkashicNotificationListenerService")
+        execCmd("/system/bin/appops", "set", packageName, "GET_USAGE_STATS", "allow")
+    }
+
     fun enableAppAccessibility(packageName: String) {
         val comp = "$packageName/$packageName.AkashicAccessibilityService"
         runCatching {
@@ -532,6 +794,7 @@ object HelperMain {
         val service = AkashicShellService(appUid)
         deliverBinder(packageName, appUid, service)
         service.enableAppAccessibility(packageName)
+        service.enableEventPermissions(packageName)
         Log.i(TAG, "HelperMain entered Looper.loop() for $packageName ($appUid)")
         Looper.loop()
     }
@@ -669,6 +932,7 @@ object ShellHelperHub {
             changed = true
         }
         if (changed) {
+            DeviceEventBroker.attachShell(iface)
             ShellStatus.notifyChanged()
             PhoneBridgeController.notifyStateChanged()
         }

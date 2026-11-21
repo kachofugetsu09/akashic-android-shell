@@ -391,6 +391,7 @@ object PhoneBridgeController {
             .put("supports_snapshot_ref", true)
             .put("supports_tree_v2", true)
             .put("supports_apps", true)
+            .put("supports_events", true)
     }
 
     private fun currentStateJson(context: Context): JSONObject {
@@ -474,6 +475,10 @@ object PhoneBridgeController {
                                         activeOwner = owner
                                         connectionError = null
                                     }
+                                    if (welcome.has("rules")) {
+                                        DeviceEventBroker.applyRules(welcome.optInt("rules_version", 1), welcome.getJSONArray("rules"))
+                                    }
+                                    DeviceEventBroker.flushAsync("connected")
                                     established = true
                                     ShellStatus.notifyChanged()
                                 } else {
@@ -520,6 +525,12 @@ object PhoneBridgeController {
     private fun handleSseEvent(context: Context, owner: ConnectionOwner, event: String, rawData: String) {
         if (event == "heartbeat") return
         val json = JSONObject(rawData)
+        if (event == "rules" || json.optString("type") == "rules") {
+            if (json.has("rules")) {
+                DeviceEventBroker.applyRules(json.optInt("rules_version", 1), json.getJSONArray("rules"))
+            }
+            return
+        }
         if (json.optString("type") != "request") return
         val requestId = json.getString("request_id")
         check(requestId.isNotBlank() && requestId.length <= 128) { "服务端请求 ID 无效" }

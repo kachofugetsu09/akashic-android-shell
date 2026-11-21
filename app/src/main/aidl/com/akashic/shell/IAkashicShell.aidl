@@ -2,6 +2,7 @@ package com.akashic.shell;
 
 import android.view.Surface;
 import android.content.Intent;
+import com.akashic.shell.IAkashicEventSink;
 
 interface IAkashicShell {
     const int TASK_TRANSFER_VERSION = 1;
@@ -19,5 +20,6 @@ interface IAkashicShell {
     int startIntent(int displayId, in Intent intent) = 12;
     int topTaskId(int sourceDisplayId) = 13;
     boolean moveTaskById(int taskId, int expectedSourceDisplayId, int targetDisplayId) = 14;
+    void registerEventSink(IAkashicEventSink sink) = 15;
     void destroy() = 16777114;
 }

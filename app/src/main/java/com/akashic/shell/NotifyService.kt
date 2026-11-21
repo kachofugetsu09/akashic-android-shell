@@ -40,6 +40,7 @@ class NotifyService : Service() {
         super.onCreate()
         prefs = ShellPrefs(this)
         Notifications.ensureChannels(this)
+        DeviceEventBroker.init(applicationContext)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
