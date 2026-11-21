@@ -25,6 +25,7 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.CookieManager
 import org.json.JSONArray
@@ -245,10 +246,16 @@ object PhoneBridgeController {
             virtualDisplayId?.let { return it }
             val dm = context.getSystemService(DisplayManager::class.java)
             val metrics = DisplayMetrics()
+            val main = dm.getDisplay(Display.DEFAULT_DISPLAY)
             @Suppress("DEPRECATION")
-            dm.getDisplay(Display.DEFAULT_DISPLAY)?.getRealMetrics(metrics)
-            val w = (metrics.widthPixels.takeIf { it > 0 } ?: 1080)
-            val h = (metrics.heightPixels.takeIf { it > 0 } ?: 2400)
+            main?.getRealMetrics(metrics)
+            // getRealMetrics 跟着主屏当前方向走：主屏横着时建出的后台屏会是横的，竖屏应用只占中间一条。
+            // 按主屏自然方向（rotation 0）定尺寸，后台屏建好后不再随主屏旋转改变。
+            val turned = main?.rotation == Surface.ROTATION_90 || main?.rotation == Surface.ROTATION_270
+            val realW = metrics.widthPixels.takeIf { it > 0 } ?: 1080
+            val realH = metrics.heightPixels.takeIf { it > 0 } ?: 2400
+            val w = if (turned) realH else realW
+            val h = if (turned) realW else realH
             val dpi = (metrics.densityDpi.takeIf { it > 0 } ?: 420)
 
             val ht = HandlerThread("akashic-vd").apply { start() }
