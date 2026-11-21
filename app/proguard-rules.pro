@@ -8,3 +8,6 @@
 }
 -keep class com.akashic.shell.HelperHandoffProvider { *; }
 -keep class com.akashic.shell.IAkashicShell* { *; }
+-keep class com.akashic.shell.IAkashicEventSink* { *; }
+-keep class com.akashic.shell.AkashicNotificationListenerService { *; }
+-keep class com.akashic.shell.EventFlushJobService { *; }
