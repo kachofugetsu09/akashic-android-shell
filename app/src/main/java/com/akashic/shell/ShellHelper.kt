@@ -493,6 +493,101 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     override fun contextualSearchPackage(): String = contextualSearchTarget
 
+    private fun resolveAllowedFile(rawPath: String): java.io.File {
+        val f = java.io.File(rawPath.trim())
+        require(f.isAbsolute) { "路径必须是绝对路径" }
+        val canonical = f.canonicalPath
+        val allowed = canonical == "/sdcard" || canonical.startsWith("/sdcard/") ||
+            canonical == "/storage/emulated/0" || canonical.startsWith("/storage/emulated/0/") ||
+            canonical == "/data/local/tmp" || canonical.startsWith("/data/local/tmp/")
+        require(allowed) { "只允许访问 /sdcard、/storage/emulated/0 或 /data/local/tmp 下的文件" }
+        return java.io.File(canonical)
+    }
+
+    override fun execShell(command: String, timeoutMs: Int, maxBytes: Int): String {
+        val clampedTimeout = timeoutMs.coerceIn(1_000, 60_000).toLong()
+        val clampedMax = maxBytes.coerceIn(1024, 256 * 1024)
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val proc = ProcessBuilder("/system/bin/sh", "-c", command)
+            .redirectErrorStream(true)
+            .start()
+        val out = java.io.ByteArrayOutputStream()
+        var truncated = false
+        val readerThread = Thread {
+            try {
+                val buf = ByteArray(4096)
+                val ins = proc.inputStream
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    val remain = clampedMax - out.size()
+                    if (remain > 0) {
+                        out.write(buf, 0, minOf(n, remain))
+                    } else {
+                        truncated = true
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        readerThread.start()
+        val finished = proc.waitFor(clampedTimeout, java.util.concurrent.TimeUnit.MILLISECONDS)
+        if (!finished) {
+            proc.destroyForcibly()
+        }
+        readerThread.join(1_500L)
+        val exitCode = if (finished) proc.exitValue() else -1
+        val elapsed = android.os.SystemClock.uptimeMillis() - t0
+        return org.json.JSONObject()
+            .put("exit_code", exitCode)
+            .put("output", out.toString("UTF-8"))
+            .put("truncated", truncated)
+            .put("timed_out", !finished)
+            .put("elapsed_ms", elapsed)
+            .toString()
+    }
+
+    override fun readFile(path: String, offset: Long, maxBytes: Int): String {
+        val file = resolveAllowedFile(path)
+        require(file.exists() && file.isFile) { "文件不存在或不是普通文件: ${file.path}" }
+        val size = file.length()
+        val start = offset.coerceAtLeast(0L).coerceAtMost(size)
+        val limit = maxBytes.coerceIn(1024, 512 * 1024)
+        val toRead = minOf(limit.toLong(), size - start).toInt()
+        val bytes = ByteArray(toRead)
+        if (toRead > 0) {
+            java.io.RandomAccessFile(file, "r").use { raf ->
+                raf.seek(start)
+                raf.readFully(bytes)
+            }
+        }
+        val eof = (start + toRead) >= size
+        return org.json.JSONObject()
+            .put("path", file.path)
+            .put("size", size)
+            .put("offset", start)
+            .put("read_bytes", toRead)
+            .put("eof", eof)
+            .put("base64", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+            .toString()
+    }
+
+    override fun writeFile(path: String, base64Data: String, append: Boolean): String {
+        val file = resolveAllowedFile(path)
+        require(base64Data.length <= 720 * 1024) { "单次写入块过大（上限 512KB）" }
+        val bytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+        require(bytes.size <= 512 * 1024) { "单次写入超过 512KB 上限" }
+        file.parentFile?.mkdirs()
+        java.io.FileOutputStream(file, append).use { fos ->
+            fos.write(bytes)
+        }
+        return org.json.JSONObject()
+            .put("path", file.path)
+            .put("written_bytes", bytes.size)
+            .put("size", file.length())
+            .toString()
+    }
+
     override fun registerEventSink(sink: IAkashicEventSink?) {
         eventSink = sink
         if (sink != null) {

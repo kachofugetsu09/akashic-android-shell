@@ -712,8 +712,10 @@ object PhoneBridgeController {
                             "PHONE_INPUT_NOT_CONFIRMED: 未能在原后台输入框读回完整目标值；内容可能已部分改变，请重新观察，不要直接重试"
                         }
                     }
-                    // 启动应用或跳转新页面时无障碍树可能还没出来；空树最多再等 1.5 秒，避免拍到空白、白传截图。
-                    val emptyDeadline = SystemClock.uptimeMillis() + 1_500L
+                    // 微信屏蔽无障碍树，不必每步白等 1.5 秒；其他应用空树最多等 1.5 秒。
+                    val isWeChat = runCatching { ShellHelperHub.shell?.topActivity(dispId) }.getOrNull()?.startsWith("com.tencent.mm/") == true
+                    val emptyWaitMs = if (isWeChat) 250L else 1_500L
+                    val emptyDeadline = SystemClock.uptimeMillis() + emptyWaitMs
                     while (act != PhoneAction.HAND_TO_USER && a11yForWait?.screenSignature(dispId)?.nodeCount == 0 &&
                         SystemClock.uptimeMillis() < emptyDeadline) {
                         SystemClock.sleep(150L)
@@ -728,6 +730,33 @@ object PhoneBridgeController {
                     ).put("state", currentStateJson(context))
                 }
                 "apps" -> response.put("ok", true).put("result", JSONObject().put("apps", launcherApps(context)))
+                "shell" -> {
+                    val cmd = payload.optString("command").trim()
+                    require(cmd.isNotEmpty()) { "command 不能为空" }
+                    val timeoutMs = payload.optInt("timeout_ms", 15_000).coerceIn(1_000, 60_000)
+                    val maxBytes = payload.optInt("max_bytes", 131_072).coerceIn(1024, 256 * 1024)
+                    val helper = ensureHelper(context)
+                    val raw = helper.execShell(cmd, timeoutMs, maxBytes)
+                    response.put("ok", true).put("result", JSONObject(raw)).put("state", currentStateJson(context))
+                }
+                "file_read" -> {
+                    val path = payload.optString("path").trim()
+                    require(path.isNotEmpty()) { "path 不能为空" }
+                    val offset = payload.optLong("offset", 0L).coerceAtLeast(0L)
+                    val maxBytes = payload.optInt("max_bytes", 262_144).coerceIn(1024, 512 * 1024)
+                    val helper = ensureHelper(context)
+                    val raw = helper.readFile(path, offset, maxBytes)
+                    response.put("ok", true).put("result", JSONObject(raw))
+                }
+                "file_write" -> {
+                    val path = payload.optString("path").trim()
+                    val b64 = payload.optString("base64")
+                    val append = payload.optBoolean("append", false)
+                    require(path.isNotEmpty()) { "path 不能为空" }
+                    val helper = ensureHelper(context)
+                    val raw = helper.writeFile(path, b64, append)
+                    response.put("ok", true).put("result", JSONObject(raw))
+                }
                 "finish" -> {
                     val finalPreview = releaseVirtualDisplay()
                     updatePip(PipMode.DONE, "已完成", finalPreview)
@@ -1039,6 +1068,13 @@ object PhoneBridgeController {
                 KeyEvent.KEYCODE_FORWARD_DEL, KeyEvent.KEYCODE_MOVE_HOME, KeyEvent.KEYCODE_MOVE_END, KeyEvent.KEYCODE_INSERT)
         check(allowed) { "后台仅支持应用文字和导航键；HOME、最近任务、音量及电源等系统控制由用户操作" }
         return code
+    }
+
+    private fun ensureHelper(context: Context): IAkashicShell {
+        ShellHelperHub.shell?.takeIf { it.asBinder().isBinderAlive }?.let { return it }
+        runCatching { ShellHelperHub.launchHelperOverAdb(context) }
+        return ShellHelperHub.shell?.takeIf { it.asBinder().isBinderAlive }
+            ?: error("PHONE_HELPER_OFFLINE: UID 2000 助手未在线，请先在 Akashic Shell 设置中完成无线调试配对")
     }
 
     /** 在创建显示器或输入之前校验动作参数，缺值不能静默变成别的动作。 */

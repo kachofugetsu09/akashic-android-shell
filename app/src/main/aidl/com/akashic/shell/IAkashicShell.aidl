@@ -23,5 +23,8 @@ interface IAkashicShell {
     void registerEventSink(IAkashicEventSink sink) = 15;
     boolean setContextualSearchOverride(boolean enabled) = 16;
     String contextualSearchPackage() = 17;
+    String execShell(String command, int timeoutMs, int maxBytes) = 18;
+    String readFile(String path, long offset, int maxBytes) = 19;
+    String writeFile(String path, String base64Data, boolean append) = 20;
     void destroy() = 16777114;
 }
