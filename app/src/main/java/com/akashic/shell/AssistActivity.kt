@@ -3,6 +3,7 @@ package com.akashic.shell
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -34,23 +35,35 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 看屏唤起半屏浮层：
- * - 接收按住底部横条（LAUNCH_CONTEXTUAL_SEARCH）与默认数字助理（ACTION_ASSIST）；
- * - 抓取截图与当前页可见文本上传给外置插件 /api/phone-assist/invoke；
- * - 在底部半屏 WebView 打开插件返回的 sheet_url，点「在 akashic 继续」时跳回 MainActivity。
+ * - AssistActivity（exported=true）仅接收系统默认数字助理 ACTION_ASSIST，拒绝未知 action；
+ * - ContextualSearchActivity（exported=false）承接按住底部横条 LAUNCH_CONTEXTUAL_SEARCH。
  */
-class AssistActivity : Activity() {
+open class AssistActivity : Activity() {
     private val io = Executors.newSingleThreadExecutor()
+    private val invokeSeq = AtomicInteger(0)
+    private val activeConn = AtomicReference<HttpURLConnection?>(null)
+
     private lateinit var prefs: ShellPrefs
+    private lateinit var sheet: FrameLayout
     private lateinit var webView: WebView
     private lateinit var loadingBox: LinearLayout
     private lateinit var statusLabel: TextView
-    private var destroyed = false
+    @Volatile private var destroyed = false
+
+    protected open fun isTrustedInvokeAction(action: String?): Boolean =
+        action == Intent.ACTION_ASSIST
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (!isTrustedInvokeAction(intent?.action)) {
+            finish()
+            return
+        }
         prefs = ShellPrefs(this)
         buildSheetUi()
         val server = prefs.serverUrl?.trimEnd('/')
@@ -63,21 +76,38 @@ class AssistActivity : Activity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (!isTrustedInvokeAction(intent.action)) return
         setIntent(intent)
         val server = prefs.serverUrl?.trimEnd('/') ?: return
         handleInvoke(server, intent)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!::sheet.isInitialized) return
+        val lp = sheet.layoutParams as? FrameLayout.LayoutParams ?: return
+        lp.height = (resources.displayMetrics.heightPixels * 0.66f).toInt()
+        sheet.layoutParams = lp
+        val paper = getColor(R.color.paper)
+        (sheet.background as? GradientDrawable)?.setColor(paper)
+        webView.setBackgroundColor(paper)
+        loadingBox.setBackgroundColor(paper)
+        statusLabel.setTextColor(getColor(R.color.action))
+    }
+
     override fun onDestroy() {
         destroyed = true
+        invokeSeq.incrementAndGet()
+        activeConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
         io.shutdownNow()
         CookieManager.getInstance().flush()
-        webView.destroy()
+        if (::webView.isInitialized) webView.destroy()
         super.onDestroy()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun buildSheetUi() {
+        @Suppress("DEPRECATION")
         window.setDecorFitsSystemWindows(false)
         val density = resources.displayMetrics.density
         val dp = { v: Int -> (v * density).toInt() }
@@ -88,7 +118,7 @@ class AssistActivity : Activity() {
         }
 
         val sheetHeight = (resources.displayMetrics.heightPixels * 0.66f).toInt()
-        val sheet = FrameLayout(this).apply {
+        sheet = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 setColor(getColor(R.color.paper))
                 val r = dp(18).toFloat()
@@ -114,20 +144,23 @@ class AssistActivity : Activity() {
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    if (!request.isForMainFrame) return false
                     val uri = request.url
+                    val server = prefs.serverUrl ?: return true
                     if (uri.scheme == "akashic-shell" && uri.host == "open-session") {
-                        val sid = uri.getQueryParameter("session")
-                        openInMainApp(sid)
+                        val currentUri = view.url?.let(Uri::parse)
+                        if (currentUri != null && Server.sameOrigin(server, currentUri)) {
+                            openInMainApp(uri.getQueryParameter("session"))
+                        }
                         return true
                     }
-                    val server = prefs.serverUrl ?: return true
                     if (Server.sameOrigin(server, uri)) return false
                     runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
                     return true
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
-                    loadingBox.visibility = View.GONE
+                    if (!destroyed) loadingBox.visibility = View.GONE
                 }
 
                 override fun onReceivedError(
@@ -135,7 +168,7 @@ class AssistActivity : Activity() {
                     request: WebResourceRequest,
                     error: WebResourceError,
                 ) {
-                    if (request.isForMainFrame) {
+                    if (!destroyed && request.isForMainFrame) {
                         showError("加载浮层失败：${error.description}")
                     }
                 }
@@ -170,7 +203,7 @@ class AssistActivity : Activity() {
         val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, sheetHeight, Gravity.BOTTOM)
         root.addView(sheet, lp)
 
-        root.setOnApplyWindowInsetsListener { view, insets ->
+        root.setOnApplyWindowInsetsListener { _, insets ->
             val ime = insets.getInsets(WindowInsets.Type.ime())
             val nav = insets.getInsets(WindowInsets.Type.navigationBars())
             val bottomPad = maxOf(ime.bottom, nav.bottom)
@@ -181,18 +214,23 @@ class AssistActivity : Activity() {
     }
 
     private fun handleInvoke(server: String, intent: Intent?) {
+        val mySeq = invokeSeq.incrementAndGet()
+        activeConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
+        webView.stopLoading()
         loadingBox.visibility = View.VISIBLE
         statusLabel.text = "正在上传屏幕快照…"
+
         val source = when (intent?.action) {
             ACTION_LAUNCH_CONTEXTUAL_SEARCH -> "nav_handle"
             Intent.ACTION_ASSIST -> "assistant"
-            else -> "manual"
+            else -> return
         }
         val extraBitmap = extractBitmap(intent)
         val visiblePkgs = intent?.getStringArrayListExtra(EXTRA_VISIBLE_PACKAGE_NAMES)
         val capturedAt = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
 
         io.execute {
+            if (destroyed || invokeSeq.get() != mySeq) return@execute
             try {
                 var pkg = visiblePkgs?.firstOrNull { it != packageName } ?: ""
                 var uiTreeText = ""
@@ -200,22 +238,23 @@ class AssistActivity : Activity() {
                 if (a11y != null) {
                     runCatching {
                         val readout = a11y.dumpScreen(Display.DEFAULT_DISPLAY, RefRegistry())
-                        if (pkg.isEmpty() && readout.packageName.isNotEmpty() && readout.packageName != packageName) {
-                            pkg = readout.packageName
-                        }
-                        val lines = LinkedHashSet<String>()
-                        val arr = readout.tree.nodes
-                        for (i in 0 until arr.length()) {
-                            val obj = arr.optJSONObject(i) ?: continue
-                            val txt = obj.optString("text").ifBlank {
-                                obj.optString("content_description").ifBlank { obj.optString("name") }
-                            }.trim()
-                            if (txt.isNotEmpty()) {
-                                lines.add(txt)
-                                if (lines.size >= 60) break
+                        // 排除浮层自身窗口，避免把加载页文字当作底层应用上下文。
+                        if (readout.packageName.isNotEmpty() && readout.packageName != packageName) {
+                            if (pkg.isEmpty()) pkg = readout.packageName
+                            val lines = LinkedHashSet<String>()
+                            val arr = readout.tree.nodes
+                            for (i in 0 until arr.length()) {
+                                val obj = arr.optJSONObject(i) ?: continue
+                                val txt = obj.optString("text").ifBlank {
+                                    obj.optString("content_description").ifBlank { obj.optString("name") }
+                                }.trim()
+                                if (txt.isNotEmpty()) {
+                                    lines.add(txt)
+                                    if (lines.size >= 60) break
+                                }
                             }
+                            uiTreeText = lines.joinToString("\n").take(2800)
                         }
-                        uiTreeText = lines.joinToString("\n").take(2800)
                     }
                 }
                 val appLabel = resolveAppLabel(pkg)
@@ -230,16 +269,17 @@ class AssistActivity : Activity() {
                 if (b64 != null) body.put("screenshot_png_b64", b64)
 
                 val resp = postJson("$server/api/phone-assist/invoke", server, body)
-                val sheetPath = resp.optString("sheet_url").ifBlank { "/api/phone-assist/sheet" }
-                val targetUrl = if (sheetPath.startsWith("http")) sheetPath else "$server$sheetPath"
-                if (!destroyed) {
-                    runOnUiThread {
+                val sheetPath = resp.optString("sheet_url").trim()
+                val safePath = if (sheetPath.startsWith("/api/phone-assist/sheet")) sheetPath else "/api/phone-assist/sheet"
+                val targetUrl = "$server$safePath"
+                runOnUiThread {
+                    if (!destroyed && invokeSeq.get() == mySeq) {
                         webView.loadUrl(targetUrl)
                     }
                 }
             } catch (t: Throwable) {
-                if (!destroyed) {
-                    runOnUiThread {
+                runOnUiThread {
+                    if (!destroyed && invokeSeq.get() == mySeq) {
                         showError("唤起失败：${t.message ?: t.javaClass.simpleName}\n请确认已登录 Akashic 且已启用 phone-assist 插件。")
                     }
                 }
@@ -257,18 +297,30 @@ class AssistActivity : Activity() {
         }
     }
 
-    private fun encodeBitmapPngBase64(bitmap: Bitmap): String {
+    private fun encodeBitmapPngBase64(bitmap: Bitmap): String? {
         val maxW = 720
-        val scaled = if (bitmap.width > maxW) {
-            val ratio = maxW.toFloat() / bitmap.width.toFloat()
-            Bitmap.createScaledBitmap(bitmap, maxW, (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
+        val maxH = 1600
+        val scale = minOf(
+            1f,
+            maxW.toFloat() / bitmap.width.coerceAtLeast(1),
+            maxH.toFloat() / bitmap.height.coerceAtLeast(1),
+        )
+        val scaled = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt().coerceAtLeast(1),
+                (bitmap.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
         } else {
             bitmap
         }
         val out = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.PNG, 85, out)
         if (scaled !== bitmap) scaled.recycle()
-        return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        val bytes = out.toByteArray()
+        if (bytes.size > MAX_UPLOAD_PNG_BYTES) return null
+        return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
     private fun resolveAppLabel(pkg: String): String {
@@ -282,6 +334,7 @@ class AssistActivity : Activity() {
     private fun postJson(urlStr: String, origin: String, payload: JSONObject): JSONObject {
         val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
+            instanceFollowRedirects = false
             connectTimeout = 8_000
             readTimeout = 15_000
             doOutput = true
@@ -289,18 +342,37 @@ class AssistActivity : Activity() {
             setRequestProperty("Origin", origin)
             CookieManager.getInstance().getCookie(origin)?.let { setRequestProperty("Cookie", it) }
         }
+        activeConn.set(conn)
         try {
             conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            val text = stream?.use { readBoundedUtf8(it, MAX_JSON_RESP_BYTES) }.orEmpty()
             if (code !in 200..299) {
                 throw IllegalStateException("HTTP $code ${text.take(160)}")
             }
             return JSONObject(text)
         } finally {
+            activeConn.compareAndSet(conn, null)
             conn.disconnect()
         }
+    }
+
+    private fun readBoundedUtf8(stream: java.io.InputStream, maxBytes: Int): String {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(4096)
+        var total = 0
+        while (true) {
+            val n = stream.read(buf)
+            if (n <= 0) break
+            val keep = minOf(n, maxBytes - total)
+            if (keep > 0) {
+                out.write(buf, 0, keep)
+                total += keep
+            }
+            if (total >= maxBytes) break
+        }
+        return out.toString("UTF-8")
     }
 
     private fun openInMainApp(sessionId: String?) {
@@ -319,8 +391,10 @@ class AssistActivity : Activity() {
     }
 
     companion object {
-        const val ACTION_LAUNCH_CONTEXTUAL_SEARCH = "android.app.action.LAUNCH_CONTEXTUAL_SEARCH"
+        const val ACTION_LAUNCH_CONTEXTUAL_SEARCH = "android.app.contextualsearch.action.LAUNCH_CONTEXTUAL_SEARCH"
         const val EXTRA_SCREENSHOT = "android.app.contextualsearch.extra.SCREENSHOT"
         const val EXTRA_VISIBLE_PACKAGE_NAMES = "android.app.contextualsearch.extra.VISIBLE_PACKAGE_NAMES"
+        private const val MAX_JSON_RESP_BYTES = 64 * 1024
+        private const val MAX_UPLOAD_PNG_BYTES = 8 * 1024 * 1024
     }
 }

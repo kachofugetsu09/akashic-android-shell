@@ -481,7 +481,7 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
             val code = proc.waitFor()
             // Pixel Android 16 上 updateSecureSetting 会抛 Package android does not belong to 2000，
             // 但内存中的 temporary-package 改派与恢复均已实际生效。
-            val applied = code == 0 || out.contains("does not belong to 2000") || out.contains("updateSecureSetting")
+            val applied = code == 0 || out.contains("Package android does not belong to 2000")
             if (applied) {
                 contextualSearchTarget = if (enabled) "com.akashic.shell" else ""
             }
@@ -1087,7 +1087,7 @@ object ShellHelperHub {
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)
                     }
-                    if (shell != null) return
+                    if (shell != null) { syncNavHandleAssist(context); return }
                 }
             } catch (t: Throwable) {
                 lastErr = t
@@ -1115,23 +1115,52 @@ object ShellHelperHub {
         throw IllegalStateException("adbd 未切到 127.0.0.1:$LOOPBACK_ADB_PORT", lastErr)
     }
 
+    private val navHandleExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "AkashicNavHandle").apply { isDaemon = true }
+    }
+
     fun syncNavHandleAssist(context: Context) {
-        val enabled = ShellPrefs(context).navHandleAssistEnabled
-        setNavHandleAssist(context, enabled) { _, _ -> }
+        val appContext = context.applicationContext
+        val prefs = ShellPrefs(appContext)
+        val want = prefs.navHandleAssistEnabled
+        val owned = prefs.navHandleOwnedByUs
+        // 从未由本应用接管且期望为关时，不动系统状态，避免误清其他所有者的临时改派。
+        if (!want && !owned) {
+            navHandleOverrideActive = false
+            navHandleStatusText = "未接管（默认圈定即搜）"
+            ShellStatus.notifyChanged()
+            return
+        }
+        setNavHandleAssist(appContext, want) { _, _ -> }
     }
 
     fun setNavHandleAssist(context: Context, enabled: Boolean, onDone: (Boolean, String) -> Unit) {
-        Thread({
+        val appContext = context.applicationContext
+        navHandleExecutor.execute {
+            val prefs = ShellPrefs(appContext)
             val s = shell
             if (s == null || !s.asBinder().isBinderAlive) {
+                val owned = prefs.navHandleOwnedByUs
                 navHandleOverrideActive = false
-                navHandleStatusText = if (enabled) "等待 UID 2000 助手上线后自动接管" else "未接管（助手离线）"
+                navHandleStatusText = when {
+                    enabled -> "等待 UID 2000 助手上线后自动接管"
+                    owned -> "待恢复：助手离线（重连后自动恢复，或重启手机复原）"
+                    else -> "未接管（默认圈定即搜）"
+                }
                 ShellStatus.notifyChanged()
-                onDone(false, if (enabled) "请先配对并启动 UID 2000 助手" else "已关闭")
-                return@Thread
+                onDone(false, if (enabled) "请先配对并启动 UID 2000 助手" else if (owned) "助手离线，重连后将自动恢复" else "未接管")
+                return@execute
+            }
+            if (!enabled && !prefs.navHandleOwnedByUs) {
+                navHandleOverrideActive = false
+                navHandleStatusText = "未接管（默认圈定即搜）"
+                ShellStatus.notifyChanged()
+                onDone(true, "未接管")
+                return@execute
             }
             val ok = runCatching { s.setContextualSearchOverride(enabled) }.getOrDefault(false)
             if (ok) {
+                prefs.setNavHandleOwnedByUs(enabled)
                 navHandleOverrideActive = enabled
                 navHandleStatusText = if (enabled) "已接管：按住底部横条唤起 Akashic" else "已恢复为系统圈定即搜"
                 ShellStatus.notifyChanged()
@@ -1141,7 +1170,7 @@ object ShellHelperHub {
                 ShellStatus.notifyChanged()
                 onDone(false, navHandleStatusText)
             }
-        }, "AkashicNavHandle").start()
+        }
     }
 
     private const val LOOPBACK_ADB_PORT = 5555

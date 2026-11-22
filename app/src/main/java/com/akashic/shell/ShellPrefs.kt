@@ -17,6 +17,7 @@ class ShellPrefs(context: Context) {
     val adbPaired: Boolean get() = prefs.getBoolean(KEY_ADB_PAIRED, false)
     val lastAdbConnectPort: Int get() = prefs.getInt(KEY_ADB_PORT, 0)
     val navHandleAssistEnabled: Boolean get() = prefs.getBoolean(KEY_NAV_HANDLE_ASSIST, false)
+    val navHandleOwnedByUs: Boolean get() = prefs.getBoolean(KEY_NAV_HANDLE_OWNED, false)
 
     // Activity 与 Service 共用同一个 SharedPreferences 锁，切换地址与保存进度不能交错。
     fun selectServer(url: String, autoConnect: Boolean) = synchronized(prefs) {
@@ -70,6 +71,10 @@ class ShellPrefs(context: Context) {
         prefs.edit().putBoolean(KEY_NAV_HANDLE_ASSIST, enabled).apply()
     }
 
+    fun setNavHandleOwnedByUs(owned: Boolean) {
+        prefs.edit().putBoolean(KEY_NAV_HANDLE_OWNED, owned).apply()
+    }
+
     private companion object {
         const val KEY_AUTO_CONNECT = "auto_connect"
         const val KEY_SERVER = "server_url"
@@ -81,5 +86,6 @@ class ShellPrefs(context: Context) {
         const val KEY_ADB_PAIRED = "adb_paired"
         const val KEY_ADB_PORT = "adb_connect_port"
         const val KEY_NAV_HANDLE_ASSIST = "nav_handle_assist_enabled"
+        const val KEY_NAV_HANDLE_OWNED = "nav_handle_owned_by_us"
     }
 }
