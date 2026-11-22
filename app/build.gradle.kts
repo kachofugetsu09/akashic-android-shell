@@ -11,8 +11,8 @@ android {
         applicationId = "com.akashic.shell"
         minSdk = 30
         targetSdk = 36
-        versionCode = 23
-        versionName = "0.7.0"
+        versionCode = 24
+        versionName = "0.7.1"
     }
 
     buildFeatures {
