@@ -5,22 +5,24 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
-import android.text.TextUtils
 import android.util.Base64
 import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -39,10 +41,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 极简原生看屏浮条（零 WebView，毫秒级秒开）：
- * - 初始只占屏幕底部一行输入框，自动弹出键盘；
- * - 截图压缩、页面文本采集与续聊查询全部后台静默执行，零阻塞；
- * - 发送后在输入框上方按内容自然撑开回复区（上限 40% 屏高），点「↗」进入完整 Akashic。
+ * 极致简约原生看屏浮条（零 WebView、零续聊条、毫秒级秒开）：
+ * - 初始只占底部一行圆角输入框，自动弹出键盘；
+ * - 拿到系统截图时，输入框左侧直接显示真实画面缩略图（点图原地看大图确认发什么，点角上 × 剥离）；
+ * - 没拿到截图就不占位置；发送后在输入框上方按内容自然撑开，右上角只留 ↗ 与 ×。
  */
 open class AssistActivity : Activity() {
     private val bgPool = Executors.newCachedThreadPool()
@@ -51,20 +53,27 @@ open class AssistActivity : Activity() {
     private val postConn = AtomicReference<HttpURLConnection?>(null)
 
     private lateinit var prefs: ShellPrefs
+    private lateinit var root: FrameLayout
+    private lateinit var stack: LinearLayout
+    private lateinit var previewCard: LinearLayout
+    private lateinit var previewImage: ImageView
+    private lateinit var previewRemoveBtn: TextView
+    private lateinit var previewCloseBtn: TextView
     private lateinit var card: LinearLayout
     private lateinit var replyBox: LinearLayout
     private lateinit var replyScroll: ScrollView
     private lateinit var replyText: TextView
     private lateinit var openFullBtn: TextView
-    private lateinit var resumeBar: TextView
+    private lateinit var closeBtn: TextView
+    private lateinit var thumbWrap: FrameLayout
+    private lateinit var thumbView: ImageView
+    private lateinit var thumbRemove: TextView
     private lateinit var inputEdit: EditText
-    private lateinit var screenChip: TextView
     private lateinit var sendBtn: TextView
 
     @Volatile private var destroyed = false
     @Volatile private var includeScreen = true
     @Volatile private var sessionId: String? = null
-    @Volatile private var resumeSessionId: String? = null
     @Volatile private var capturedSource = "nav_handle"
     @Volatile private var capturedPkg = ""
     @Volatile private var capturedAppLabel = ""
@@ -74,6 +83,7 @@ open class AssistActivity : Activity() {
     @Volatile private var contextAttachedOnce = false
     @Volatile private var busy = false
 
+    private var previewBitmap: Bitmap? = null
     private val seenMsgIds = LinkedHashSet<String>()
     private val transcript = StringBuilder()
 
@@ -88,14 +98,14 @@ open class AssistActivity : Activity() {
         }
         prefs = ShellPrefs(this)
         buildMinimalUi()
-        prepareInvokeAsync(intent)
+        prepareInvoke(intent)
         inputEdit.postDelayed({
             if (!destroyed) {
                 inputEdit.requestFocus()
                 val imm = getSystemService(InputMethodManager::class.java)
                 imm?.showSoftInput(inputEdit, InputMethodManager.SHOW_IMPLICIT)
             }
-        }, 40L)
+        }, 35L)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -103,20 +113,14 @@ open class AssistActivity : Activity() {
         if (!isTrustedInvokeAction(intent.action)) return
         setIntent(intent)
         resetForNewInvoke()
-        prepareInvokeAsync(intent)
+        prepareInvoke(intent)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (!::card.isInitialized) return
         applyThemeColors()
-        val maxReplyH = (resources.displayMetrics.heightPixels * 0.38f).toInt()
-        replyScroll.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply {
-            if (replyScroll.height > maxReplyH) height = maxReplyH
-        }
+        constrainReplyHeight()
     }
 
     override fun onDestroy() {
@@ -125,6 +129,7 @@ open class AssistActivity : Activity() {
         streamConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
         postConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
         bgPool.shutdownNow()
+        previewBitmap = null
         super.onDestroy()
     }
 
@@ -133,48 +138,116 @@ open class AssistActivity : Activity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+    private fun clipRounded(view: View, radiusPx: Float) {
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, outline: Outline) {
+                outline.setRoundRect(0, 0, v.width, v.height, radiusPx)
+            }
+        }
+        view.clipToOutline = true
+    }
+
     private fun buildMinimalUi() {
         @Suppress("DEPRECATION")
         window.setDecorFitsSystemWindows(false)
 
-        val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(72, 0, 0, 0))
-            setOnClickListener { finish() }
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(56, 0, 0, 0))
+            setOnClickListener {
+                if (previewCard.visibility == View.VISIBLE) {
+                    previewCard.visibility = View.GONE
+                } else {
+                    finish()
+                }
+            }
         }
 
+        stack = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = false
+        }
+
+        // 1. 点击缩略图后原地展开的真实待发画面预览卡（默认隐藏）
+        previewCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(10), dp(10), dp(10), dp(8))
+            isClickable = true
+        }
+        previewImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+            maxHeight = (resources.displayMetrics.heightPixels * 0.44f).toInt()
+        }
+        clipRounded(previewImage, dp(10).toFloat())
+
+        val prevBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(2), dp(8), dp(2), 0)
+        }
+        previewCloseBtn = TextView(this).apply {
+            text = "收起"
+            textSize = 12f
+            setPadding(dp(4), dp(4), dp(12), dp(4))
+            setOnClickListener { previewCard.visibility = View.GONE }
+        }
+        val prevSpacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        }
+        previewRemoveBtn = TextView(this).apply {
+            text = "去掉这张图"
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(4), dp(4), dp(4))
+            setOnClickListener { removeScreenshot() }
+        }
+        prevBar.addView(previewCloseBtn)
+        prevBar.addView(prevSpacer)
+        prevBar.addView(previewRemoveBtn)
+
+        previewCard.addView(previewImage, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        previewCard.addView(prevBar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+
+        // 2. 底部极简悬浮卡片
         card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
             isClickable = true
         }
 
-        // 1. 回复区（初始隐藏，发消息后按内容撑开）
+        // 回复区（初始隐藏，发送后按内容撑开）
         replyBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(2), 0, dp(2), dp(8))
+            setPadding(dp(4), 0, dp(2), dp(8))
         }
-
         val replyTop = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
             setPadding(0, 0, 0, dp(4))
         }
-        val titleHint = TextView(this).apply {
-            text = "Akashic"
-            textSize = 12f
-            setTypeface(null, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
         openFullBtn = TextView(this).apply {
-            text = "继续 ↗"
-            textSize = 12f
-            setPadding(dp(8), dp(2), dp(4), dp(2))
+            text = "↗"
+            textSize = 15f
+            setPadding(dp(8), dp(2), dp(8), dp(2))
             visibility = View.GONE
             setOnClickListener { openInMainApp(sessionId) }
         }
-        replyTop.addView(titleHint)
+        closeBtn = TextView(this).apply {
+            text = "×"
+            textSize = 17f
+            setPadding(dp(8), dp(2), dp(4), dp(2))
+            setOnClickListener { finish() }
+        }
         replyTop.addView(openFullBtn)
+        replyTop.addView(closeBtn)
 
         replyScroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
@@ -191,43 +264,39 @@ open class AssistActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
 
-        // 2. 可选极细续聊提示（仅 10 分钟内有上次时出现）
-        resumeBar = TextView(this).apply {
-            textSize = 12f
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            setPadding(dp(4), 0, dp(4), dp(6))
-            visibility = View.GONE
-            setOnClickListener {
-                val sid = resumeSessionId ?: return@setOnClickListener
-                sessionId = sid
-                visibility = View.GONE
-                replyBox.visibility = View.VISIBLE
-                openFullBtn.visibility = View.VISIBLE
-                replyText.text = "已切到上次对话，继续发消息即可。"
-                startSse(sid)
-            }
-        }
-
-        // 3. 底部单行输入栏
+        // 单行输入栏：真实缩略图（有图才显示） + 输入框 + 发送箭头
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        screenChip = TextView(this).apply {
-            text = "屏"
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+        thumbWrap = FrameLayout(this).apply {
+            visibility = View.GONE
+            clipChildren = false
+            clipToPadding = false
+            setPadding(0, dp(4), dp(6), dp(2))
+        }
+        thumbView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
             setOnClickListener {
-                includeScreen = !includeScreen
-                updateChipVisual()
+                if (previewBitmap != null) {
+                    previewCard.visibility = if (previewCard.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                }
             }
         }
+        clipRounded(thumbView, dp(7).toFloat())
+        thumbRemove = TextView(this).apply {
+            text = "×"
+            textSize = 10f
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setOnClickListener { removeScreenshot() }
+        }
+        thumbWrap.addView(thumbView, FrameLayout.LayoutParams(dp(30), dp(40), Gravity.START or Gravity.CENTER_VERTICAL))
+        thumbWrap.addView(thumbRemove, FrameLayout.LayoutParams(dp(16), dp(16), Gravity.END or Gravity.TOP))
 
         inputEdit = EditText(this).apply {
-            hint = "问问这一屏…"
+            hint = "问这一屏…"
             textSize = 15f
             background = null
             maxLines = 3
@@ -242,27 +311,35 @@ open class AssistActivity : Activity() {
         }
 
         sendBtn = TextView(this).apply {
-            text = "发送"
-            textSize = 13f
+            text = "↑"
+            textSize = 16f
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(7), dp(12), dp(7))
             setOnClickListener { sendCurrentInput() }
         }
 
-        bar.addView(screenChip, LinearLayout.LayoutParams(
+        bar.addView(thumbWrap, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
         bar.addView(inputEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(sendBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ))
+        bar.addView(sendBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
+            marginStart = dp(4)
+        })
 
         card.addView(replyBox)
-        card.addView(resumeBar)
         card.addView(bar)
+
+        stack.addView(previewCard, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            bottomMargin = dp(8)
+        })
+        stack.addView(card, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
 
         val lp = FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -271,7 +348,7 @@ open class AssistActivity : Activity() {
         ).apply {
             setMargins(dp(10), 0, dp(10), dp(10))
         }
-        root.addView(card, lp)
+        root.addView(stack, lp)
 
         root.setOnApplyWindowInsetsListener { view, insets ->
             val ime = insets.getInsets(WindowInsets.Type.ime())
@@ -295,55 +372,59 @@ open class AssistActivity : Activity() {
 
         card.background = GradientDrawable().apply {
             setColor(bg)
-            cornerRadius = dp(20).toFloat()
+            cornerRadius = dp(18).toFloat()
             setStroke(dp(1), stroke)
         }
+        previewCard.background = GradientDrawable().apply {
+            setColor(bg)
+            cornerRadius = dp(16).toFloat()
+            setStroke(dp(1), stroke)
+        }
+        thumbRemove.setTextColor(bg)
+        thumbRemove.background = GradientDrawable().apply {
+            setColor(ink)
+            cornerRadius = dp(99).toFloat()
+        }
+        previewCloseBtn.setTextColor(muted)
+        previewRemoveBtn.setTextColor(accent)
         replyText.setTextColor(ink)
         openFullBtn.setTextColor(accent)
-        resumeBar.setTextColor(muted)
+        closeBtn.setTextColor(muted)
         inputEdit.setTextColor(ink)
         inputEdit.setHintTextColor(muted)
         sendBtn.setTextColor(onAccent)
         sendBtn.background = GradientDrawable().apply {
             setColor(accent)
-            cornerRadius = dp(14).toFloat()
+            cornerRadius = dp(99).toFloat()
         }
-        updateChipVisual()
     }
 
-    private fun updateChipVisual() {
-        val dark = isNightMode()
-        val activeBg = if (dark) Color.parseColor("#2D3A47") else Color.parseColor("#E3EBF3")
-        val activeFg = if (dark) Color.parseColor("#A4C1E0") else Color.parseColor("#2D4A6A")
-        val idleBg = if (dark) Color.parseColor("#282622") else Color.parseColor("#EFECE4")
-        val idleFg = if (dark) Color.parseColor("#8A867E") else Color.parseColor("#85817A")
-
-        screenChip.text = if (includeScreen) "带屏" else "纯问"
-        screenChip.setTextColor(if (includeScreen) activeFg else idleFg)
-        screenChip.background = GradientDrawable().apply {
-            setColor(if (includeScreen) activeBg else idleBg)
-            cornerRadius = dp(12).toFloat()
-        }
+    private fun removeScreenshot() {
+        includeScreen = false
+        capturedPngB64 = null
+        previewBitmap = null
+        thumbWrap.visibility = View.GONE
+        previewCard.visibility = View.GONE
     }
 
     private fun resetForNewInvoke() {
         streamConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
         postConn.getAndSet(null)?.let { runCatching { it.disconnect() } }
         sessionId = null
-        resumeSessionId = null
         contextAttachedOnce = false
         includeScreen = true
         busy = false
+        previewBitmap = null
         seenMsgIds.clear()
         transcript.setLength(0)
         replyBox.visibility = View.GONE
         openFullBtn.visibility = View.GONE
-        resumeBar.visibility = View.GONE
+        previewCard.visibility = View.GONE
+        thumbWrap.visibility = View.GONE
         replyText.text = ""
-        updateChipVisual()
     }
 
-    private fun prepareInvokeAsync(intent: Intent?) {
+    private fun prepareInvoke(intent: Intent?) {
         val mySeq = invokeSeq.incrementAndGet()
         capturedSource = when (intent?.action) {
             ACTION_LAUNCH_CONTEXTUAL_SEARCH -> "nav_handle"
@@ -358,10 +439,20 @@ open class AssistActivity : Activity() {
         capturedPngB64 = null
         capturedUiTree = ""
 
-        // 1. 后台静默编码截图与提取无障碍文本，绝不阻塞弹出
+        // 有真实截图立刻渲染到缩略图和预览图，不写任何文字占位
+        if (extraBitmap != null) {
+            previewBitmap = extraBitmap
+            thumbView.setImageBitmap(extraBitmap)
+            previewImage.setImageBitmap(extraBitmap)
+            thumbWrap.visibility = View.VISIBLE
+        } else {
+            thumbWrap.visibility = View.GONE
+        }
+
+        // 截图压缩与无障碍文本采集在后台静默跑，零阻塞
         bgPool.execute {
             if (destroyed || invokeSeq.get() != mySeq) return@execute
-            if (extraBitmap != null) {
+            if (extraBitmap != null && includeScreen) {
                 capturedPngB64 = encodeBitmapPngBase64(extraBitmap)
             }
             val a11y = AkashicAccessibilityService.instance
@@ -390,27 +481,6 @@ open class AssistActivity : Activity() {
                 }
             }
         }
-
-        // 2. 后台静默拉取 10 分钟内续聊候选（有就悄悄显示一行小字）
-        val server = prefs.serverUrl?.trimEnd('/') ?: return
-        bgPool.execute {
-            if (destroyed || invokeSeq.get() != mySeq) return@execute
-            runCatching {
-                val res = getJson("$server/api/phone-assist/resume", server)
-                val resume = res.optJSONObject("resume") ?: return@runCatching
-                val sid = resume.optString("session_id")
-                val title = resume.optString("title")
-                if (sid.isNotBlank()) {
-                    runOnUiThread {
-                        if (!destroyed && invokeSeq.get() == mySeq && sessionId == null) {
-                            resumeSessionId = sid
-                            resumeBar.text = "接着上次：$title"
-                            resumeBar.visibility = View.VISIBLE
-                        }
-                    }
-                }
-            }
-        }
     }
 
     private fun sendCurrentInput() {
@@ -418,34 +488,36 @@ open class AssistActivity : Activity() {
         if (text.isEmpty() || busy) return
         val server = prefs.serverUrl?.trimEnd('/')
         if (server.isNullOrEmpty()) {
-            showReplyStatus("尚未配置服务器，请先打开 Akashic 主应用。")
+            showReplyStatus("尚未配置服务器，请先打开主应用连接。")
             return
         }
         val mySeq = invokeSeq.get()
         busy = true
-        sendBtn.alpha = 0.5f
-        resumeBar.visibility = View.GONE
+        sendBtn.alpha = 0.45f
+        previewCard.visibility = View.GONE
         replyBox.visibility = View.VISIBLE
-        if (transcript.isEmpty()) {
-            replyText.text = "思考中…"
-        } else {
-            replyText.text = "${transcript}\n\n思考中…"
-        }
+        replyText.text = if (transcript.isEmpty()) "思考中…" else "${transcript}\n\n思考中…"
 
         val sendWithScreen = includeScreen && !contextAttachedOnce
+        val bitmapSnap = previewBitmap
         bgPool.execute {
             try {
+                // 如果用户打字极快、后台还没编码完，这里原地补编一次
+                val pngB64 = if (sendWithScreen) {
+                    capturedPngB64 ?: bitmapSnap?.let(::encodeBitmapPngBase64)?.also { capturedPngB64 = it }
+                } else null
+
                 val payload = JSONObject()
                     .put("text", text)
                     .put("source", capturedSource)
                     .put("package_name", capturedPkg)
                     .put("app_label", capturedAppLabel)
                     .put("captured_at", capturedTime)
-                    .put("include_screenshot", sendWithScreen)
+                    .put("include_screenshot", sendWithScreen && (pngB64 != null || capturedUiTree.isNotEmpty()))
                 sessionId?.let { payload.put("session_id", it) }
                 if (sendWithScreen) {
                     if (capturedUiTree.isNotEmpty()) payload.put("ui_tree_text", capturedUiTree)
-                    capturedPngB64?.let { payload.put("screenshot_png_b64", it) }
+                    if (pngB64 != null) payload.put("screenshot_png_b64", pngB64)
                 }
 
                 val resp = postJson("$server/api/phone-assist/ask", server, payload)
@@ -458,6 +530,7 @@ open class AssistActivity : Activity() {
                 runOnUiThread {
                     if (destroyed || invokeSeq.get() != mySeq) return@runOnUiThread
                     inputEdit.setText("")
+                    thumbWrap.visibility = View.GONE
                     openFullBtn.visibility = View.VISIBLE
                     busy = false
                     sendBtn.alpha = 1f
@@ -517,7 +590,6 @@ open class AssistActivity : Activity() {
                     }
                 }
             } catch (_: Throwable) {
-                // 正常退出或断连不刷屏
             } finally {
                 streamConn.compareAndSet(conn, null)
                 conn.disconnect()
@@ -541,7 +613,7 @@ open class AssistActivity : Activity() {
                 constrainReplyHeight()
             } else if (role == "assistant" && finish == "continue") {
                 val base = if (transcript.isNotEmpty()) "${transcript}\n\n" else ""
-                replyText.text = "${base}执行工具中…"
+                replyText.text = "${base}执行中…"
             } else if (role == "control" && text.isNotEmpty()) {
                 val base = if (transcript.isNotEmpty()) "${transcript}\n\n" else ""
                 replyText.text = "${base}$text"
@@ -550,7 +622,7 @@ open class AssistActivity : Activity() {
     }
 
     private fun constrainReplyHeight() {
-        val maxH = (resources.displayMetrics.heightPixels * 0.38f).toInt()
+        val maxH = (resources.displayMetrics.heightPixels * 0.36f).toInt()
         replyScroll.post {
             if (destroyed) return@post
             val lp = replyScroll.layoutParams
@@ -609,23 +681,6 @@ open class AssistActivity : Activity() {
             val info = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(info).toString()
         }.getOrDefault(pkg)
-    }
-
-    private fun getJson(urlStr: String, origin: String): JSONObject {
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            instanceFollowRedirects = false
-            connectTimeout = 4_000
-            readTimeout = 4_000
-            setRequestProperty("Origin", origin)
-            CookieManager.getInstance().getCookie(origin)?.let { setRequestProperty("Cookie", it) }
-        }
-        try {
-            if (conn.responseCode !in 200..299) throw IllegalStateException("HTTP ${conn.responseCode}")
-            return JSONObject(readBoundedUtf8(conn.inputStream, 16 * 1024))
-        } finally {
-            conn.disconnect()
-        }
     }
 
     private fun postJson(urlStr: String, origin: String, payload: JSONObject): JSONObject {
