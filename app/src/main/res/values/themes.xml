@@ -8,4 +8,11 @@
     </style>
 
     <style name="Theme.Shell" parent="Theme.Shell.Base" />
+
+    <style name="Theme.Shell.Assist" parent="Theme.Shell.Base">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@android:style/Animation</item>
+    </style>
 </resources>

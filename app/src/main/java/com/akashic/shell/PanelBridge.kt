@@ -23,6 +23,8 @@ interface PanelHost {
     fun openAccessibilitySettings()
     fun openWirelessDebuggingSettings()
     fun pairWirelessDebugging(code: String, portText: String)
+    fun setNavHandleAssist(enable: Boolean)
+    fun openAssistantSettings()
 }
 
 // JS 回调运行在 WebView 的桥线程上，这里统一切回主线程。
@@ -46,6 +48,8 @@ class PanelBridge(private val host: PanelHost) {
     @JavascriptInterface fun openAccessibilitySettings() = post { host.openAccessibilitySettings() }
     @JavascriptInterface fun openWirelessDebuggingSettings() = post { host.openWirelessDebuggingSettings() }
     @JavascriptInterface fun pairWirelessDebugging(code: String, portText: String) = post { host.pairWirelessDebugging(code, portText) }
+    @JavascriptInterface fun setNavHandleAssist(enable: Boolean) = post { host.setNavHandleAssist(enable) }
+    @JavascriptInterface fun openAssistantSettings() = post { host.openAssistantSettings() }
 
     private fun post(action: () -> Unit) {
         main.post(action)

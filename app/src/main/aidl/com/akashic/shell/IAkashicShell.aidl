@@ -21,5 +21,7 @@ interface IAkashicShell {
     int topTaskId(int sourceDisplayId) = 13;
     boolean moveTaskById(int taskId, int expectedSourceDisplayId, int targetDisplayId) = 14;
     void registerEventSink(IAkashicEventSink sink) = 15;
+    boolean setContextualSearchOverride(boolean enabled) = 16;
+    String contextualSearchPackage() = 17;
     void destroy() = 16777114;
 }

@@ -467,6 +467,32 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         false
     }
 
+    @Volatile private var contextualSearchTarget: String = ""
+
+    override fun setContextualSearchOverride(enabled: Boolean): Boolean {
+        val cmd = if (enabled) {
+            listOf("cmd", "contextual_search", "set", "temporary-package", "com.akashic.shell", "120000")
+        } else {
+            listOf("cmd", "contextual_search", "set", "temporary-package")
+        }
+        return try {
+            val proc = ProcessBuilder(cmd).redirectErrorStream(true).start()
+            val out = proc.inputStream.bufferedReader().use { it.readText() }
+            val code = proc.waitFor()
+            // Pixel Android 16 上 updateSecureSetting 会抛 Package android does not belong to 2000，
+            // 但内存中的 temporary-package 改派与恢复均已实际生效。
+            val applied = code == 0 || out.contains("does not belong to 2000") || out.contains("updateSecureSetting")
+            if (applied) {
+                contextualSearchTarget = if (enabled) "com.akashic.shell" else ""
+            }
+            applied
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    override fun contextualSearchPackage(): String = contextualSearchTarget
+
     override fun registerEventSink(sink: IAkashicEventSink?) {
         eventSink = sink
         if (sink != null) {
@@ -881,6 +907,8 @@ object ShellHelperHub {
     @Volatile var statusText: String = "未配对（当前为普通无障碍模式）"
         private set
     @Volatile var pairingInProgress: Boolean = false
+    @Volatile var navHandleOverrideActive: Boolean = false
+    @Volatile var navHandleStatusText: String = "未接管（默认圈定即搜）"
         private set
     @Volatile private var handoffLatch: CountDownLatch? = null
     private val startLock = Any()
@@ -1085,6 +1113,35 @@ object ShellHelperHub {
             }
         }
         throw IllegalStateException("adbd 未切到 127.0.0.1:$LOOPBACK_ADB_PORT", lastErr)
+    }
+
+    fun syncNavHandleAssist(context: Context) {
+        val enabled = ShellPrefs(context).navHandleAssistEnabled
+        setNavHandleAssist(context, enabled) { _, _ -> }
+    }
+
+    fun setNavHandleAssist(context: Context, enabled: Boolean, onDone: (Boolean, String) -> Unit) {
+        Thread({
+            val s = shell
+            if (s == null || !s.asBinder().isBinderAlive) {
+                navHandleOverrideActive = false
+                navHandleStatusText = if (enabled) "等待 UID 2000 助手上线后自动接管" else "未接管（助手离线）"
+                ShellStatus.notifyChanged()
+                onDone(false, if (enabled) "请先配对并启动 UID 2000 助手" else "已关闭")
+                return@Thread
+            }
+            val ok = runCatching { s.setContextualSearchOverride(enabled) }.getOrDefault(false)
+            if (ok) {
+                navHandleOverrideActive = enabled
+                navHandleStatusText = if (enabled) "已接管：按住底部横条唤起 Akashic" else "已恢复为系统圈定即搜"
+                ShellStatus.notifyChanged()
+                onDone(true, if (enabled) "已接管底部横条" else "已恢复系统圈定即搜")
+            } else {
+                navHandleStatusText = if (enabled) "接管失败（可尝试设为默认数字助理）" else "恢复失败（重启手机可复原）"
+                ShellStatus.notifyChanged()
+                onDone(false, navHandleStatusText)
+            }
+        }, "AkashicNavHandle").start()
     }
 
     private const val LOOPBACK_ADB_PORT = 5555

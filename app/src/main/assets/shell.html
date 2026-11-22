@@ -199,6 +199,20 @@
         <input id="st-adb-port" type="text" inputmode="numeric" maxlength="5" placeholder="端口(可选)" style="margin:0;width:96px;padding:10px 12px;font-size:15px">
         <button class="small" id="st-adb-pair" type="button">配对</button>
       </div>
+      <div class="row">
+        <div class="text">
+          <div class="title">按住底部横条唤起 Akashic</div>
+          <div class="sub" id="st-nav-assist-sub">未接管（默认圈定即搜）</div>
+        </div>
+        <label class="switch"><input id="st-nav-assist-toggle" type="checkbox"><span></span></label>
+      </div>
+      <div class="row">
+        <div class="text">
+          <div class="title">设为默认数字助理</div>
+          <div class="sub">开启后角落斜滑或长按电源键也可唤起半屏看屏助手</div>
+        </div>
+        <button class="small" id="st-assistant-open" type="button">去设置</button>
+      </div>
     </div>
 
     <p class="foot">Akashic 外壳 <span id="st-version"></span> · 聊天内容只保存在服务器上<br>长按桌面图标也可以打开这里</p>
@@ -312,6 +326,8 @@
     $("st-adb-sub").textContent = state.adbHelperStatus || (state.adbHelperActive ? "已激活 UID 2000 后台独立虚拟屏" : "未配对（当前为普通无障碍模式）");
     $("st-adb-pair").disabled = !!state.adbPairingBusy;
     $("st-adb-pair").textContent = state.adbPairingBusy ? "配对中…" : (state.adbHelperActive ? "已激活" : "配对");
+    $("st-nav-assist-toggle").checked = !!state.navHandleAssistEnabled;
+    $("st-nav-assist-sub").textContent = state.navHandleAssistStatus || (state.navHandleAssistActive ? "已接管：按住底部横条唤起 Akashic" : "未接管（默认圈定即搜）");
     $("st-version").textContent = state.version || "";
   }
 
@@ -398,6 +414,8 @@
   $("st-phone-toggle").addEventListener("change", function (event) { shell.setPhoneUse(event.target.checked); });
   $("st-a11y").addEventListener("click", function () { shell.openAccessibilitySettings(); });
   $("st-adb-open").addEventListener("click", function () { shell.openWirelessDebuggingSettings(); });
+  $("st-nav-assist-toggle").addEventListener("change", function (e) { shell.setNavHandleAssist(!!e.target.checked); });
+  $("st-assistant-open").addEventListener("click", function () { shell.openAssistantSettings(); });
   $("st-adb-pair").addEventListener("click", function () {
     shell.pairWirelessDebugging($("st-adb-code").value || "", $("st-adb-port").value || "");
   });

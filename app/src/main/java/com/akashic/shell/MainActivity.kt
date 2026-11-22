@@ -84,6 +84,7 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         }
         pipView.updateState(PhoneBridgeController::currentPipState)
         NotifyService.sync(this)
+        if (ShellHelperHub.shell != null) ShellHelperHub.syncNavHandleAssist(this)
         refreshPanel()
         if (panelMode == null) syncBarsWithPage()
     }
@@ -205,6 +206,9 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
         .put("adbHelperActive", ShellHelperHub.shell != null)
         .put("adbHelperStatus", ShellHelperHub.statusText)
         .put("adbPairingBusy", ShellHelperHub.pairingInProgress)
+        .put("navHandleAssistEnabled", prefs.navHandleAssistEnabled)
+        .put("navHandleAssistActive", ShellHelperHub.navHandleOverrideActive)
+        .put("navHandleAssistStatus", ShellHelperHub.navHandleStatusText)
         .put("deviceId", PhoneBridgeController.deviceId(this))
         .put("version", BuildInfo.VERSION)
         .toString()
@@ -381,6 +385,22 @@ class MainActivity : Activity(), RemoteHost, PanelHost {
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
                 refreshPanel()
             }
+        }
+    }
+
+    override fun setNavHandleAssist(enable: Boolean) {
+        prefs.setNavHandleAssistEnabled(enable)
+        ShellHelperHub.setNavHandleAssist(this, enable) { _, msg ->
+            runOnUiThread {
+                if (msg.isNotBlank()) Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                refreshPanel()
+            }
+        }
+    }
+
+    override fun openAssistantSettings() {
+        if (!launch(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))) {
+            launch(Intent(Settings.ACTION_SETTINGS))
         }
     }
 
