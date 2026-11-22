@@ -326,5 +326,5 @@ private fun saveBytesToMediaStore(context: Context, bytes: ByteArray, mimeType: 
 }
 
 object BuildInfo {
-    const val VERSION = "0.6.1"
+    val VERSION: String get() = BuildConfig.VERSION_NAME
 }
