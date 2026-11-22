@@ -97,15 +97,12 @@ open class AssistActivity : Activity() {
             return
         }
         prefs = ShellPrefs(this)
+        window.setSoftInputMode(
+            android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        )
         buildMinimalUi()
         prepareInvoke(intent)
-        inputEdit.postDelayed({
-            if (!destroyed) {
-                inputEdit.requestFocus()
-                val imm = getSystemService(InputMethodManager::class.java)
-                imm?.showSoftInput(inputEdit, InputMethodManager.SHOW_IMPLICIT)
-            }
-        }, 35L)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -152,6 +149,9 @@ open class AssistActivity : Activity() {
         window.setDecorFitsSystemWindows(false)
 
         root = FrameLayout(this).apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
+            requestFocus()
             setBackgroundColor(Color.argb(56, 0, 0, 0))
             setOnClickListener {
                 if (previewCard.visibility == View.VISIBLE) {
@@ -298,6 +298,11 @@ open class AssistActivity : Activity() {
         inputEdit = EditText(this).apply {
             hint = "问这一屏…"
             textSize = 15f
+            setOnClickListener {
+                requestFocus()
+                val imm = getSystemService(InputMethodManager::class.java)
+                imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+            }
             background = null
             maxLines = 3
             imeOptions = EditorInfo.IME_ACTION_SEND
