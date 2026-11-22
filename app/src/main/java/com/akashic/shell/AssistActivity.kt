@@ -45,13 +45,22 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * 极致简约原生看屏浮条：
- * - 零 WebView、零续聊条、唤起时不自动弹键盘，点输入框再输入；
- * - 左侧真实画面缩略图（点图原地看大图确认发什么，点角上 × 剥离）；
- * - 点发送 0ms 乐观上屏（轻震动、立刻清输入框收键盘、问题直接上屏）；
- * - JPEG 轻量压缩上传 + SSE 实时逐字流式吐字。
+ * 极简原生看屏浮条：
+ * - 零 WebView、唤起时不自动弹键盘，点输入框再输入；
+ * - 左侧真实画面缩略图（点图原地看大图，点 × 剥离）；
+ * - iMessage 轻气泡 + Web 端同款「新轮次置顶锚点」（新问句推到顶部，流式回复在正下方长出，支持自由向上翻阅）；
+ * - 内置零依赖 MiniMarkdown 实时渲染。
  */
 open class AssistActivity : Activity() {
+    private data class TurnSlot(
+        val container: LinearLayout,
+        val userBubble: TextView,
+        val toolLine: TextView,
+        val replyView: TextView,
+        val committedText: StringBuilder = StringBuilder(),
+        var latestRawMarkdown: String = "",
+    )
+
     private val bgPool = Executors.newCachedThreadPool()
     private val invokeSeq = AtomicInteger(0)
     private val streamConn = AtomicReference<HttpURLConnection?>(null)
@@ -67,8 +76,7 @@ open class AssistActivity : Activity() {
     private lateinit var card: LinearLayout
     private lateinit var replyBox: LinearLayout
     private lateinit var replyScroll: ScrollView
-    private lateinit var promptEcho: TextView
-    private lateinit var replyText: TextView
+    private lateinit var turnsContainer: LinearLayout
     private lateinit var openFullBtn: TextView
     private lateinit var closeBtn: TextView
     private lateinit var thumbWrap: FrameLayout
@@ -91,7 +99,9 @@ open class AssistActivity : Activity() {
 
     private var previewBitmap: Bitmap? = null
     private val seenMsgIds = LinkedHashSet<String>()
-    private val committedTranscript = StringBuilder()
+    private val turns = ArrayList<TurnSlot>()
+    private var currentTurn: TurnSlot? = null
+    private var userScrolledUp = false
 
     protected open fun isTrustedInvokeAction(action: String?): Boolean =
         action == Intent.ACTION_ASSIST
@@ -123,7 +133,7 @@ open class AssistActivity : Activity() {
         super.onConfigurationChanged(newConfig)
         if (!::card.isInitialized) return
         applyThemeColors()
-        constrainReplyHeight()
+        updateViewportBounds()
     }
 
     override fun onDestroy() {
@@ -140,6 +150,50 @@ open class AssistActivity : Activity() {
         (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun maxReplyViewportPx(): Int =
+        (resources.displayMetrics.heightPixels * 0.40f).toInt().coerceAtLeast(dp(180))
+
+    private fun palette(): Palette {
+        val dark = isNightMode()
+        return if (dark) {
+            Palette(
+                bg = Color.parseColor("#1E1D1A"),
+                stroke = Color.parseColor("#35332E"),
+                ink = Color.parseColor("#E2DFD7"),
+                muted = Color.parseColor("#9A968E"),
+                accent = Color.parseColor("#A4C1E0"),
+                onAccent = Color.parseColor("#102031"),
+                codeBg = Color.parseColor("#2B2925"),
+                userBubble = Color.parseColor("#2D4A6A"),
+                userBubbleInk = Color.parseColor("#F5F8FC"),
+            )
+        } else {
+            Palette(
+                bg = Color.parseColor("#F9F8F4"),
+                stroke = Color.parseColor("#DDD9CE"),
+                ink = Color.parseColor("#292622"),
+                muted = Color.parseColor("#736F68"),
+                accent = Color.parseColor("#2D4A6A"),
+                onAccent = Color.parseColor("#FBFAF6"),
+                codeBg = Color.parseColor("#ECE9E0"),
+                userBubble = Color.parseColor("#2D4A6A"),
+                userBubbleInk = Color.parseColor("#FBFAF6"),
+            )
+        }
+    }
+
+    private data class Palette(
+        val bg: Int,
+        val stroke: Int,
+        val ink: Int,
+        val muted: Int,
+        val accent: Int,
+        val onAccent: Int,
+        val codeBg: Int,
+        val userBubble: Int,
+        val userBubbleInk: Int,
+    )
 
     private fun clipRounded(view: View, radiusPx: Float) {
         view.outlineProvider = object : ViewOutlineProvider() {
@@ -179,7 +233,7 @@ open class AssistActivity : Activity() {
             isClickable = false
         }
 
-        // 1. 点击缩略图后原地展开的真实待发画面预览卡
+        // 1. 缩略图大图预览卡
         previewCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -207,9 +261,7 @@ open class AssistActivity : Activity() {
                 previewCard.visibility = View.GONE
             }
         }
-        val prevSpacer = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
-        }
+        val prevSpacer = View(this).apply { layoutParams = LinearLayout.LayoutParams(0, 1, 1f) }
         previewRemoveBtn = TextView(this).apply {
             text = "去掉这张图"
             textSize = 12f
@@ -230,56 +282,57 @@ open class AssistActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
 
-        // 2. 底部极简悬浮卡片
+        // 2. 底部悬浮卡片
         card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
             isClickable = true
         }
 
-        // 回复区（初始隐藏，点发送瞬间乐观展开）
+        // 回复区（初始隐藏，发送后以 iMessage 轻气泡 + 最新轮次置顶展开）
         replyBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(4), 0, dp(2), dp(8))
+            setPadding(dp(2), 0, dp(2), dp(6))
         }
         val replyTop = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(4))
-        }
-        promptEcho = TextView(this).apply {
-            textSize = 12f
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(2))
         }
         openFullBtn = TextView(this).apply {
             text = "↗"
             textSize = 15f
-            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setPadding(dp(8), dp(0), dp(8), dp(2))
             visibility = View.GONE
             setOnClickListener { openInMainApp(sessionId) }
         }
         closeBtn = TextView(this).apply {
             text = "×"
             textSize = 17f
-            setPadding(dp(6), dp(2), dp(4), dp(2))
+            setPadding(dp(6), dp(0), dp(4), dp(2))
             setOnClickListener { finish() }
         }
-        replyTop.addView(promptEcho)
         replyTop.addView(openFullBtn)
         replyTop.addView(closeBtn)
 
         replyScroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
+            isFillViewport = false
+            setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                if (scrollY < oldScrollY - dp(4)) {
+                    userScrolledUp = true
+                }
+            }
         }
-        replyText = TextView(this).apply {
-            textSize = 14f
-            setLineSpacing(dp(3).toFloat(), 1f)
-            setTextIsSelectable(true)
+        turnsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(2), dp(2), dp(2), dp(6))
         }
-        replyScroll.addView(replyText)
+        replyScroll.addView(turnsContainer, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
         replyBox.addView(replyTop)
         replyBox.addView(replyScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -351,9 +404,7 @@ open class AssistActivity : Activity() {
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
         bar.addView(inputEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(sendBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply {
-            marginStart = dp(4)
-        })
+        bar.addView(sendBtn, LinearLayout.LayoutParams(dp(34), dp(34)).apply { marginStart = dp(4) })
 
         card.addView(replyBox)
         card.addView(bar)
@@ -386,42 +437,173 @@ open class AssistActivity : Activity() {
     }
 
     private fun applyThemeColors() {
-        val dark = isNightMode()
-        val bg = if (dark) Color.parseColor("#1E1D1A") else Color.parseColor("#F9F8F4")
-        val stroke = if (dark) Color.parseColor("#35332E") else Color.parseColor("#DDD9CE")
-        val ink = if (dark) Color.parseColor("#E2DFD7") else Color.parseColor("#292622")
-        val muted = if (dark) Color.parseColor("#9A968E") else Color.parseColor("#736F68")
-        val accent = if (dark) Color.parseColor("#A4C1E0") else Color.parseColor("#2D4A6A")
-        val onAccent = if (dark) Color.parseColor("#102031") else Color.parseColor("#FBFAF6")
-
+        val p = palette()
         card.background = GradientDrawable().apply {
-            setColor(bg)
+            setColor(p.bg)
             cornerRadius = dp(18).toFloat()
-            setStroke(dp(1), stroke)
+            setStroke(dp(1), p.stroke)
         }
         previewCard.background = GradientDrawable().apply {
-            setColor(bg)
+            setColor(p.bg)
             cornerRadius = dp(16).toFloat()
-            setStroke(dp(1), stroke)
+            setStroke(dp(1), p.stroke)
         }
-        thumbRemove.setTextColor(bg)
+        thumbRemove.setTextColor(p.bg)
         thumbRemove.background = GradientDrawable().apply {
-            setColor(ink)
+            setColor(p.ink)
             cornerRadius = dp(99).toFloat()
         }
-        previewCloseBtn.setTextColor(muted)
-        previewRemoveBtn.setTextColor(accent)
-        promptEcho.setTextColor(muted)
-        replyText.setTextColor(ink)
-        openFullBtn.setTextColor(accent)
-        closeBtn.setTextColor(muted)
-        inputEdit.setTextColor(ink)
-        inputEdit.setHintTextColor(muted)
-        sendBtn.setTextColor(onAccent)
+        previewCloseBtn.setTextColor(p.muted)
+        previewRemoveBtn.setTextColor(p.accent)
+        openFullBtn.setTextColor(p.accent)
+        closeBtn.setTextColor(p.muted)
+        inputEdit.setTextColor(p.ink)
+        inputEdit.setHintTextColor(p.muted)
+        sendBtn.setTextColor(p.onAccent)
         sendBtn.background = GradientDrawable().apply {
-            setColor(accent)
+            setColor(p.accent)
             cornerRadius = dp(99).toFloat()
         }
+        // 刷新已有轮次的气泡与 Markdown 配色
+        for (slot in turns) {
+            slot.userBubble.background = makeUserBubbleBg(p.userBubble)
+            slot.userBubble.setTextColor(p.userBubbleInk)
+            slot.toolLine.setTextColor(p.muted)
+            slot.replyView.setTextColor(p.ink)
+            if (slot.latestRawMarkdown.isNotEmpty()) {
+                slot.replyView.text = MiniMarkdown.render(slot.latestRawMarkdown, p.codeBg, p.muted, p.accent)
+            }
+        }
+    }
+
+    private fun makeUserBubbleBg(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            setColor(color)
+            val r = dp(15).toFloat()
+            val tail = dp(5).toFloat()
+            cornerRadii = floatArrayOf(r, r, r, r, tail, tail, r, r)
+        }
+
+    private fun createTurnSlot(userText: String, withThumb: Bitmap?): TurnSlot {
+        val p = palette()
+        // 释放上一轮的置顶最小高度，让历史自然紧排
+        turns.lastOrNull()?.container?.minimumHeight = 0
+
+        val turnBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, if (turns.isEmpty()) 0 else dp(12), 0, dp(4))
+        }
+
+        // 右对齐 iMessage 用户气泡（带图时左侧紧贴一张迷你缩略图）
+        val userRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END or Gravity.BOTTOM
+        }
+        if (withThumb != null) {
+            val mini = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setImageBitmap(withThumb)
+            }
+            clipRounded(mini, dp(6).toFloat())
+            userRow.addView(mini, LinearLayout.LayoutParams(dp(24), dp(32)).apply {
+                marginEnd = dp(6)
+            })
+        }
+        val userBubble = TextView(this).apply {
+            text = userText
+            textSize = 14f
+            setTextColor(p.userBubbleInk)
+            background = makeUserBubbleBg(p.userBubble)
+            setPadding(dp(12), dp(7), dp(12), dp(7))
+            maxWidth = (resources.displayMetrics.widthPixels * 0.72f).toInt()
+        }
+        userRow.addView(userBubble)
+
+        // 工具灰字（按需显现）
+        val toolLine = TextView(this).apply {
+            textSize = 12f
+            setTextColor(p.muted)
+            setPadding(dp(2), dp(6), dp(2), 0)
+            visibility = View.GONE
+        }
+
+        // 左对齐助手 Markdown 正文
+        val replyView = TextView(this).apply {
+            text = "…"
+            textSize = 14.5f
+            setTextColor(p.ink)
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(dp(2), dp(8), dp(4), dp(2))
+            setTextIsSelectable(true)
+        }
+
+        turnBox.addView(userRow, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        turnBox.addView(toolLine, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        turnBox.addView(replyView, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+
+        val slot = TurnSlot(turnBox, userBubble, toolLine, replyView)
+        turns.add(slot)
+        currentTurn = slot
+        turnsContainer.addView(turnBox, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+
+        // 多轮对话时启用「新轮次置顶锚点」：把新问句滚到视口最顶部，下方留出流式输出空间
+        val maxH = maxReplyViewportPx()
+        if (turns.size >= 2) {
+            turnBox.minimumHeight = maxH - dp(8)
+            val lp = replyScroll.layoutParams
+            lp.height = maxH
+            replyScroll.layoutParams = lp
+        }
+        userScrolledUp = false
+        replyScroll.post {
+            if (!destroyed) {
+                replyScroll.smoothScrollTo(0, turnBox.top)
+            }
+        }
+        return slot
+    }
+
+    private fun updateViewportBounds() {
+        val maxH = maxReplyViewportPx()
+        replyScroll.post {
+            if (destroyed) return@post
+            val lp = replyScroll.layoutParams
+            val targetH = if (turns.size >= 2 || turnsContainer.height > maxH) maxH else ViewGroup.LayoutParams.WRAP_CONTENT
+            if (lp.height != targetH) {
+                lp.height = targetH
+                replyScroll.layoutParams = lp
+            }
+            if (!userScrolledUp) {
+                val cur = currentTurn
+                if (cur != null && turns.size >= 2) {
+                    // 若当前轮次内容还没超出视口，保持用户气泡锚在顶部；超出视口后跟随最新尾部
+                    val turnBottom = cur.container.top + cur.container.height
+                    val desired = maxOf(cur.container.top, turnBottom - maxH)
+                    replyScroll.smoothScrollTo(0, desired)
+                } else if (turnsContainer.height > maxH) {
+                    replyScroll.fullScroll(View.FOCUS_DOWN)
+                }
+            }
+        }
+    }
+
+    private fun renderSlotMarkdown(slot: TurnSlot, raw: String) {
+        val p = palette()
+        slot.latestRawMarkdown = raw
+        slot.replyView.text = MiniMarkdown.render(raw, p.codeBg, p.muted, p.accent)
+        updateViewportBounds()
     }
 
     private fun hideKeyboard() {
@@ -448,13 +630,18 @@ open class AssistActivity : Activity() {
         busy = false
         previewBitmap = null
         seenMsgIds.clear()
-        committedTranscript.setLength(0)
+        turns.clear()
+        currentTurn = null
+        userScrolledUp = false
+        turnsContainer.removeAllViews()
+        replyScroll.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
         replyBox.visibility = View.GONE
         openFullBtn.visibility = View.GONE
         previewCard.visibility = View.GONE
         thumbWrap.visibility = View.GONE
-        promptEcho.text = ""
-        replyText.text = ""
         inputEdit.hint = "问这一屏…"
     }
 
@@ -482,7 +669,6 @@ open class AssistActivity : Activity() {
             thumbWrap.visibility = View.GONE
         }
 
-        // 后台静默压缩为轻量 JPEG（~80KB）+ 读无障碍树，零阻塞弹出
         bgPool.execute {
             if (destroyed || invokeSeq.get() != mySeq) return@execute
             if (extraBitmap != null && includeScreen) {
@@ -521,14 +707,16 @@ open class AssistActivity : Activity() {
         if (text.isEmpty() || busy) return
         val server = prefs.serverUrl?.trimEnd('/')
         if (server.isNullOrEmpty()) {
-            showReplyStatus("尚未配置服务器，请先打开主应用连接。")
+            replyBox.visibility = View.VISIBLE
+            val slot = createTurnSlot(text, null)
+            slot.replyView.text = "尚未配置服务器，请先打开主应用连接。"
             return
         }
         val mySeq = invokeSeq.get()
         val sendWithScreen = includeScreen && !contextAttachedOnce
         val bitmapSnap = previewBitmap
 
-        // 0ms 乐观上屏：轻震动、立刻清空输入框并收键盘、把刚问的话放到回复区顶行
+        // 0ms 乐观上屏：震动、清输入框、收键盘、创建新轮次气泡并置顶锚定
         sendBtn.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         animateCard()
         busy = true
@@ -538,9 +726,8 @@ open class AssistActivity : Activity() {
         hideKeyboard()
         previewCard.visibility = View.GONE
         if (sendWithScreen) thumbWrap.visibility = View.GONE
-        promptEcho.text = text
         replyBox.visibility = View.VISIBLE
-        replyText.text = if (committedTranscript.isEmpty()) "…" else "${committedTranscript}\n\n…"
+        val slot = createTurnSlot(text, if (sendWithScreen) bitmapSnap else null)
 
         bgPool.execute {
             try {
@@ -580,10 +767,9 @@ open class AssistActivity : Activity() {
                     if (destroyed || invokeSeq.get() != mySeq) return@runOnUiThread
                     busy = false
                     sendBtn.alpha = 1f
-                    // 失败时把草稿还回输入框，绝不丢字
                     if (inputEdit.text.isNullOrEmpty()) inputEdit.setText(text)
                     if (sendWithScreen && previewBitmap != null) thumbWrap.visibility = View.VISIBLE
-                    showReplyStatus("发送失败：${t.message ?: t.javaClass.simpleName}")
+                    slot.replyView.text = "发送失败：${t.message ?: t.javaClass.simpleName}"
                 }
             }
         }
@@ -610,7 +796,7 @@ open class AssistActivity : Activity() {
                 if (conn.responseCode !in 200..299) {
                     runOnUiThread {
                         if (!destroyed && invokeSeq.get() == mySeq) {
-                            showReplyStatus("连接回复流失败（HTTP ${conn.responseCode}）")
+                            currentTurn?.replyView?.text = "连接回复流失败（HTTP ${conn.responseCode}）"
                         }
                     }
                     return@execute
@@ -650,12 +836,12 @@ open class AssistActivity : Activity() {
         val thinking = obj.optBoolean("thinking", false)
         runOnUiThread {
             if (destroyed || invokeSeq.get() != mySeq) return@runOnUiThread
-            val base = if (committedTranscript.isNotEmpty()) "${committedTranscript}\n\n" else ""
+            val slot = currentTurn ?: return@runOnUiThread
+            val base = if (slot.committedText.isNotEmpty()) "${slot.committedText}\n\n" else ""
             if (liveText.isNotEmpty()) {
-                replyText.text = base + liveText
-                constrainReplyHeight()
-            } else if (thinking) {
-                replyText.text = base + "思考中…"
+                renderSlotMarkdown(slot, base + liveText)
+            } else if (thinking && slot.committedText.isEmpty()) {
+                slot.replyView.text = "思考中…"
             }
         }
     }
@@ -669,39 +855,32 @@ open class AssistActivity : Activity() {
         runOnUiThread {
             if (destroyed || invokeSeq.get() != mySeq) return@runOnUiThread
             if (!seenMsgIds.add(mid)) return@runOnUiThread
-            if (role == "assistant" && text.isNotEmpty()) {
-                if (committedTranscript.isNotEmpty()) committedTranscript.append("\n\n")
-                committedTranscript.append(text)
-                replyText.text = if (finish == "continue") "${committedTranscript}\n\n…" else committedTranscript.toString()
-                constrainReplyHeight()
-            } else if (role == "assistant" && finish == "continue") {
+            val slot = currentTurn ?: return@runOnUiThread
+            if (role == "assistant") {
                 val tools = obj.optJSONArray("tools")
-                val toolHint = if (tools != null && tools.length() > 0) "正在调用 ${tools.optString(0)}…" else "…"
-                val base = if (committedTranscript.isNotEmpty()) "${committedTranscript}\n\n" else ""
-                replyText.text = base + toolHint
+                if (tools != null && tools.length() > 0) {
+                    val names = (0 until tools.length()).mapNotNull { tools.optString(it).takeIf(String::isNotBlank) }
+                    if (names.isNotEmpty()) {
+                        slot.toolLine.text = "调用 ${names.joinToString("、")}"
+                        slot.toolLine.visibility = View.VISIBLE
+                    }
+                }
+                if (text.isNotEmpty()) {
+                    if (slot.committedText.isNotEmpty()) slot.committedText.append("\n\n")
+                    slot.committedText.append(text)
+                    val display = if (finish == "continue") "${slot.committedText}\n\n…" else slot.committedText.toString()
+                    renderSlotMarkdown(slot, display)
+                }
+            } else if (role == "tool") {
+                val tname = obj.optString("tool_name").ifBlank { "工具" }
+                val err = obj.optBoolean("is_error", false)
+                slot.toolLine.text = if (err) "工具失败：$tname" else "已完成：$tname"
+                slot.toolLine.visibility = View.VISIBLE
             } else if (role == "control" && text.isNotEmpty()) {
-                val base = if (committedTranscript.isNotEmpty()) "${committedTranscript}\n\n" else ""
-                replyText.text = base + text
+                val base = if (slot.committedText.isNotEmpty()) "${slot.committedText}\n\n" else ""
+                renderSlotMarkdown(slot, base + text)
             }
         }
-    }
-
-    private fun constrainReplyHeight() {
-        val maxH = (resources.displayMetrics.heightPixels * 0.36f).toInt()
-        replyScroll.post {
-            if (destroyed) return@post
-            val lp = replyScroll.layoutParams
-            if (replyText.height > maxH && lp.height != maxH) {
-                lp.height = maxH
-                replyScroll.layoutParams = lp
-            }
-            replyScroll.fullScroll(View.FOCUS_DOWN)
-        }
-    }
-
-    private fun showReplyStatus(msg: String) {
-        replyBox.visibility = View.VISIBLE
-        replyText.text = msg
     }
 
     @Suppress("DEPRECATION")
