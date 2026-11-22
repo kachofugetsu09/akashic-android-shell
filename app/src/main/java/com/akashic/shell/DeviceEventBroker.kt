@@ -43,6 +43,7 @@ private data class SubscriptionRule(
     val enabled: Boolean,
     val adapter: String,
     val packages: Set<String>?, // null => wildcard "*"
+    val excludePackages: Set<String>,
     val titleRegex: Pattern?,
     val textRegex: Pattern?,
     val ignoreOngoing: Boolean,
@@ -177,7 +178,7 @@ object DeviceEventBroker {
             [
               {"id":"wechat-notifications","enabled":true,"adapter":"notification","package":"com.tencent.mm","match":{"ignore_ongoing":true},"actions":{"auto_cancel":true,"redact":"full","cooldown_s":0,"delivery":"realtime"}},
               {"id":"app-sessions","enabled":true,"adapter":"foreground","package":"*","match":{"min_duration_s":15},"actions":{"redact":"full","cooldown_s":0,"delivery":"batch"}},
-              {"id":"appops-sensors","enabled":true,"adapter":"appops","package":"*","match":{"ops":["FINE_LOCATION","CAMERA","RECORD_AUDIO"]},"actions":{"redact":"full","cooldown_s":10,"delivery":"batch"}},
+              {"id":"appops-sensors","enabled":true,"adapter":"appops","package":"*","exclude_packages":["com.google.android.as"],"match":{"ops":["FINE_LOCATION","CAMERA","RECORD_AUDIO"]},"actions":{"redact":"full","cooldown_s":120,"delivery":"batch"}},
               {"id":"media-playback","enabled":true,"adapter":"media","package":"*","match":{},"actions":{"redact":"full","cooldown_s":5,"delivery":"batch"}},
               {"id":"device-context","enabled":true,"adapter":"device","package":null,"match":{},"actions":{"redact":"full","cooldown_s":5,"delivery":"batch"}}
             ]
@@ -195,9 +196,20 @@ object DeviceEventBroker {
             val adapter = obj.optString("adapter").trim()
             if (id.isEmpty() || adapter.isEmpty()) continue
             val pkgRaw = if (obj.isNull("package")) "*" else obj.optString("package", "*").trim()
-            val packages = if (pkgRaw.isEmpty() || pkgRaw == "*") null else {
-                pkgRaw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            val exclList = ArrayList<String>()
+            val exclArr = obj.optJSONArray("exclude_packages")
+            if (exclArr != null) {
+                for (idx in 0 until exclArr.length()) {
+                    val item = exclArr.optString(idx).trim()
+                    if (item.isNotEmpty()) exclList.add(item)
+                }
+            } else if (!obj.isNull("exclude_packages")) {
+                val exclStr = obj.optString("exclude_packages").trim()
+                if (exclStr.isNotEmpty()) {
+                    exclStr.split(',').map { it.trim() }.filter { it.isNotEmpty() }.forEach { exclList.add(it) }
+                }
             }
+            val pkgFilter = EventRuleMatcher.parsePackageFilter(pkgRaw, exclList)
             val match = obj.optJSONObject("match") ?: JSONObject()
             val actions = obj.optJSONObject("actions") ?: JSONObject()
             val titleRx = match.optString("title_regex").trim().takeIf { !match.isNull("title_regex") && it.isNotEmpty() }
@@ -214,7 +226,8 @@ object DeviceEventBroker {
                     id = id,
                     enabled = obj.optBoolean("enabled", true),
                     adapter = adapter,
-                    packages = packages,
+                    packages = pkgFilter.includes,
+                    excludePackages = pkgFilter.excludes,
                     titleRegex = titleRx,
                     textRegex = textRx,
                     ignoreOngoing = match.optBoolean("ignore_ongoing", true),
@@ -302,6 +315,7 @@ object DeviceEventBroker {
                     val label = resolveAppLabel(pkg)
                     val title = if (eventType == "app_session") "$label 停留 ${durationS}s" else "切换到 $label"
                     val summary = if (actName.isNotEmpty()) "$pkg ($actName)" else pkg
+                    if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
                     enqueueEvent(
                         eventId = "fg:${pkg}:${tsMs}:${eventType}",
                         tsMs = tsMs,
@@ -321,9 +335,11 @@ object DeviceEventBroker {
                 val active = payload.optBoolean("active", false)
                 for (rule in matchingRules("appops", pkg, tsMs)) {
                     if (rule.opsFilter != null && op !in rule.opsFilter) continue
-                    if (!passCooldown("${rule.id}:$pkg:$op:$active", rule.cooldownS)) continue
                     val label = resolveAppLabel(pkg)
                     val title = "$label ${if (active) "开启" else "结束"} $op"
+                    val summary = "$op active=$active"
+                    if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
+                    if (!passCooldown("${rule.id}:$pkg:$op:$active", rule.cooldownS)) continue
                     enqueueEvent(
                         eventId = "op:${pkg}:${op}:${tsMs}:${active}",
                         tsMs = tsMs,
@@ -343,10 +359,11 @@ object DeviceEventBroker {
                 val mediaTitle = payload.optString("title")
                 val artist = payload.optString("artist")
                 for (rule in matchingRules("media", pkg, tsMs)) {
-                    if (!passCooldown("${rule.id}:$pkg:$state:$mediaTitle", rule.cooldownS)) continue
                     val label = resolveAppLabel(pkg)
                     val title = if (mediaTitle.isNotEmpty()) "$label [$state] $mediaTitle" else "$label [$state]"
                     val summary = listOf(mediaTitle, artist).filter { it.isNotEmpty() }.joinToString(" · ")
+                    if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
+                    if (!passCooldown("${rule.id}:$pkg:$state:$mediaTitle", rule.cooldownS)) continue
                     enqueueEvent(
                         eventId = "media:${UUID.randomUUID()}",
                         tsMs = tsMs,
@@ -367,6 +384,7 @@ object DeviceEventBroker {
     private fun onDeviceContextEvent(eventType: String, title: String, summary: String, payload: JSONObject) {
         val nowMs = System.currentTimeMillis()
         for (rule in matchingRules("device", "", nowMs)) {
+            if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
             if (!passCooldown("${rule.id}:$eventType", rule.cooldownS)) continue
             enqueueEvent(
                 eventId = "dev:${eventType}:${nowMs}",
@@ -385,10 +403,16 @@ object DeviceEventBroker {
 
     private fun matchingRules(adapter: String, packageName: String, nowMs: Long): List<SubscriptionRule> {
         return rules.filter { rule ->
-            rule.enabled &&
-                rule.adapter == adapter &&
-                (rule.expiresAtMs == null || rule.expiresAtMs > nowMs) &&
-                (rule.packages == null || packageName in rule.packages)
+            EventRuleMatcher.matchesTarget(
+                enabled = rule.enabled,
+                ruleAdapter = rule.adapter,
+                eventAdapter = adapter,
+                expiresAtMs = rule.expiresAtMs,
+                nowMs = nowMs,
+                includes = rule.packages,
+                excludes = rule.excludePackages,
+                packageName = packageName,
+            )
         }
     }
 
@@ -586,6 +610,8 @@ object DeviceEventBroker {
                     for (rule in matchingRules("foreground", pkg, ev.timeStamp)) {
                         if (durS < rule.minDurationS) continue
                         val label = resolveAppLabel(pkg)
+                        val title = "$label 停留 ${durS}s"
+                        if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, pkg)) continue
                         enqueueEvent(
                             eventId = "usage:${pkg}:${started}:${ev.timeStamp}",
                             tsMs = ev.timeStamp,
@@ -593,7 +619,7 @@ object DeviceEventBroker {
                             eventType = "usage_session",
                             ruleId = rule.id,
                             packageName = pkg,
-                            title = "$label 停留 ${durS}s",
+                            title = title,
                             summary = pkg,
                             payload = JSONObject().put("duration_s", durS).put("entered_at_ms", started).put("source", "usage_stats"),
                             delivery = rule.delivery,
