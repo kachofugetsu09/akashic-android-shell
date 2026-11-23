@@ -11,3 +11,5 @@
 -keep class com.akashic.shell.IAkashicEventSink* { *; }
 -keep class com.akashic.shell.AkashicNotificationListenerService { *; }
 -keep class com.akashic.shell.EventFlushJobService { *; }
+-keep class com.akashic.shell.AkashicAccessibilityService { *; }
+-keep class com.google.android.accessibility.selecttospeak.SelectToSpeakService { *; }
