@@ -833,16 +833,17 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     fun enableAppAccessibility(packageName: String) {
-        val comp = "$packageName/$packageName.AkashicAccessibilityService"
         runCatching {
-            val p = ProcessBuilder("/system/bin/sh", "-c",
-                "cur=$(settings get secure enabled_accessibility_services); " +
-                "case \":\$cur:\" in *\":$comp:\"* ) ;; * ) " +
-                "if [ -z \"\$cur\" ] || [ \"\$cur\" = \"null\" ]; then next=\"$comp\"; else next=\"\$cur:$comp\"; fi; " +
-                "settings put secure enabled_accessibility_services \"\$next\"; ;; esac; " +
-                "settings put secure accessibility_enabled 1"
-            ).start()
-            p.waitFor(5, TimeUnit.SECONDS)
+            val curProc = ProcessBuilder("/system/bin/settings", "get", "secure", "enabled_accessibility_services")
+                .redirectErrorStream(true)
+                .start()
+            val cur = curProc.inputStream.bufferedReader().readText().trim()
+            curProc.waitFor(5, TimeUnit.SECONDS)
+            val next = AccessibilityComponentMigration.merge(cur, packageName)
+            if (next != cur) {
+                execCmd("/system/bin/settings", "put", "secure", "enabled_accessibility_services", next)
+            }
+            execCmd("/system/bin/settings", "put", "secure", "accessibility_enabled", "1")
         }
     }
 

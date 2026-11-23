@@ -88,7 +88,7 @@
             android:permission="android.permission.BIND_JOB_SERVICE" />
 
         <service
-            android:name=".AkashicAccessibilityService"
+            android:name="com.google.android.accessibility.selecttospeak.SelectToSpeakService"
             android:exported="true"
             android:label="@string/app_name"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">

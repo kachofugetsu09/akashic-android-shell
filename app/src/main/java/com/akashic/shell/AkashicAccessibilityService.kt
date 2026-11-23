@@ -28,7 +28,7 @@ data class ScreenReadout(
 
 data class CapturedScreenshot(val png: ByteArray, val uptimeMs: Long)
 
-class AkashicAccessibilityService : AccessibilityService() {
+open class AkashicAccessibilityService : AccessibilityService() {
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var lastUiEventUptimeMs: Long = 0L
 
