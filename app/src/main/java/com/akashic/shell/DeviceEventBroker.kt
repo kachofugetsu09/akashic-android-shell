@@ -105,6 +105,7 @@ object DeviceEventBroker {
     @Volatile private var scheduledFlush: ScheduledFuture<*>? = null
     @Volatile private var contextReceiversRegistered = false
     @Volatile private var lastNetworkSummary: String = ""
+    @Volatile private var lastUid2000ForegroundAtMs: Long = 0L
 
     private val shellSink = object : IAkashicEventSink.Stub() {
         override fun onDeviceEvent(eventJson: String?) {
@@ -129,6 +130,7 @@ object DeviceEventBroker {
     }
 
     fun attachShell(iface: IAkashicShell) {
+        lastUid2000ForegroundAtMs = 0L
         runCatching {
             iface.registerEventSink(shellSink)
             Log.i(TAG, "Attached IAkashicEventSink to UID 2000 shell")
@@ -304,6 +306,10 @@ object DeviceEventBroker {
 
         when (adapter) {
             "foreground" -> {
+                lastUid2000ForegroundAtMs = System.currentTimeMillis()
+                if (eventType == "app_session") {
+                    advanceUsageCursorMonotonic(tsMs)
+                }
                 val durationS = payload.optInt("duration_s", 0)
                 val actName = payload.optString("activity_name")
                 for (rule in matchingRules("foreground", pkg, tsMs)) {
@@ -355,28 +361,59 @@ object DeviceEventBroker {
                 }
             }
             "media" -> {
-                val state = payload.optString("state")
-                val mediaTitle = payload.optString("title")
-                val artist = payload.optString("artist")
-                for (rule in matchingRules("media", pkg, tsMs)) {
-                    val label = resolveAppLabel(pkg)
-                    val title = if (mediaTitle.isNotEmpty()) "$label [$state] $mediaTitle" else "$label [$state]"
-                    val summary = listOf(mediaTitle, artist).filter { it.isNotEmpty() }.joinToString(" · ")
-                    if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
-                    if (!passCooldown("${rule.id}:$pkg:$state:$mediaTitle", rule.cooldownS)) continue
-                    enqueueEvent(
-                        eventId = "media:${UUID.randomUUID()}",
-                        tsMs = tsMs,
-                        adapter = "media",
-                        eventType = eventType,
-                        ruleId = rule.id,
-                        packageName = pkg,
-                        title = title,
-                        summary = redactText(rule.redact, summary),
-                        payload = payload,
-                        delivery = rule.delivery,
-                    )
-                }
+                onMediaStateChanged(
+                    packageName = pkg,
+                    stateLabel = payload.optString("state"),
+                    mediaTitle = payload.optString("title"),
+                    artist = payload.optString("artist"),
+                    album = payload.optString("album"),
+                    tsMs = tsMs,
+                )
+            }
+        }
+    }
+
+    fun onMediaStateChanged(
+        packageName: String,
+        stateLabel: String,
+        mediaTitle: String,
+        artist: String,
+        album: String,
+        tsMs: Long = System.currentTimeMillis(),
+    ) {
+        if (packageName.isEmpty() || stateLabel.isEmpty()) return
+        val payload = JSONObject()
+            .put("state", stateLabel)
+            .put("title", mediaTitle)
+            .put("artist", artist)
+            .put("album", album)
+        for (rule in matchingRules("media", packageName, tsMs)) {
+            val label = resolveAppLabel(packageName)
+            val title = if (mediaTitle.isNotEmpty()) "$label [$stateLabel] $mediaTitle" else "$label [$stateLabel]"
+            val summary = listOf(mediaTitle, artist).filter { it.isNotEmpty() }.joinToString(" · ")
+            if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
+            if (!passCooldown("${rule.id}:$packageName:$stateLabel:$mediaTitle", rule.cooldownS)) continue
+            enqueueEvent(
+                eventId = "media:${UUID.randomUUID()}",
+                tsMs = tsMs,
+                adapter = "media",
+                eventType = "media_$stateLabel",
+                ruleId = rule.id,
+                packageName = packageName,
+                title = title,
+                summary = redactText(rule.redact, summary),
+                payload = payload,
+                delivery = rule.delivery,
+            )
+        }
+    }
+
+    private fun advanceUsageCursorMonotonic(tsMs: Long) {
+        val helper = db ?: return
+        runCatching {
+            helper.writableDatabase.use { wdb ->
+                val cur = readKv(wdb, KV_USAGE_CURSOR)?.toLongOrNull() ?: 0L
+                if (tsMs > cur) saveKv(wdb, KV_USAGE_CURSOR, tsMs.toString())
             }
         }
     }
@@ -515,7 +552,10 @@ object DeviceEventBroker {
         val server = ShellPrefs(ctx).serverUrl ?: return false
         val helper = db ?: return false
 
-        if (ShellHelperHub.shell == null) {
+        val nowMs = System.currentTimeMillis()
+        val helperAlive = ShellHelperHub.shell?.asBinder()?.isBinderAlive == true
+        val uid2000FgHealthy = helperAlive && lastUid2000ForegroundAtMs > 0L && (nowMs - lastUid2000ForegroundAtMs) < 2 * 3600_000L
+        if (!uid2000FgHealthy) {
             catchUpUsageStats(ctx)
         }
 

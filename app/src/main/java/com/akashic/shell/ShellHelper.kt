@@ -16,10 +16,6 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.ActivityInfo
 import android.database.Cursor
 import android.hardware.display.DisplayManager
-import android.media.MediaMetadata
-import android.media.session.MediaController
-import android.media.session.MediaSessionManager
-import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.HandlerThread
 import android.hardware.display.VirtualDisplay
@@ -123,8 +119,6 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     private var eventHandler: Handler? = null
     private var lastFgPackage: String? = null
     private var lastFgEnteredMs: Long = 0L
-    private val mediaCallbacks = HashMap<String, Pair<MediaController, MediaController.Callback>>()
-    private val lastMediaState = HashMap<String, String>()
 
     init {
         Thread({ keepAwakeLoop() }, "AkashicKeepAwake").apply {
@@ -621,8 +615,35 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         }
         startForegroundObservers()
         startAppOpsObserver()
-        startMediaObserver()
     }
+
+    private fun readStaticField(cls: Class<*>, name: String): Any? =
+        runCatching {
+            cls.getDeclaredField(name).apply { isAccessible = true }.get(null)
+        }.recoverCatching {
+            cls.getField(name).get(null)
+        }.getOrNull()
+
+    private fun interfaceBinderProxy(itf: Class<*>, binder: Binder): Any =
+        java.lang.reflect.Proxy.newProxyInstance(itf.classLoader, arrayOf(itf)) { proxy, method, args ->
+            when (method.name) {
+                "asBinder" -> binder
+                "equals" -> proxy === args?.firstOrNull()
+                "hashCode" -> System.identityHashCode(proxy)
+                "toString" -> "AkashicProxy(${itf.simpleName})"
+                else -> when (method.returnType) {
+                    java.lang.Boolean.TYPE -> false
+                    java.lang.Integer.TYPE -> 0
+                    java.lang.Long.TYPE -> 0L
+                    java.lang.Float.TYPE -> 0f
+                    java.lang.Double.TYPE -> 0.0
+                    java.lang.Short.TYPE -> 0.toShort()
+                    java.lang.Byte.TYPE -> 0.toByte()
+                    java.lang.Character.TYPE -> 0.toChar()
+                    else -> null
+                }
+            }
+        }
 
     @SuppressLint("PrivateApi")
     private fun startForegroundObservers() {
@@ -636,16 +657,20 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         // 1. ITaskStackListener (ActivityTaskManager)
         runCatching {
             val stubCls = Class.forName("android.app.ITaskStackListener\$Stub")
-            val desc = stubCls.getField("DESCRIPTOR").get(null) as String
-            val txMoved = runCatching { stubCls.getField("TRANSACTION_onTaskMovedToFront").getInt(null) }.getOrDefault(-1)
-            val txStack = runCatching { stubCls.getField("TRANSACTION_onTaskStackChanged").getInt(null) }.getOrDefault(-1)
-            val listener = object : Binder() {
+            val itf = Class.forName("android.app.ITaskStackListener")
+            val desc = (readStaticField(stubCls, "DESCRIPTOR") as? String) ?: itf.name
+            val txIds = listOf(
+                "TRANSACTION_onTaskMovedToFront",
+                "TRANSACTION_onTaskStackChanged",
+                "TRANSACTION_onTaskFocusChanged",
+            ).mapNotNull { (readStaticField(stubCls, it) as? Int)?.takeIf { id -> id > 0 } }.toSet()
+            val listenerBinder = object : Binder() {
                 override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
                     if (code == INTERFACE_TRANSACTION) {
                         reply?.writeString(desc)
                         return true
                     }
-                    if (code == txMoved || code == txStack) {
+                    if (code in FIRST_CALL_TRANSACTION..LAST_CALL_TRANSACTION && (txIds.isEmpty() || code in txIds)) {
                         runCatching { data.enforceInterface(desc) }
                         scheduleCheck()
                         return true
@@ -653,9 +678,9 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
                     return super.onTransact(code, data, reply, flags)
                 }
             }
-            val itf = Class.forName("android.app.ITaskStackListener")
-            taskManager.javaClass.getMethod("registerTaskStackListener", itf).invoke(taskManager, listener)
-            Log.i(TAG, "Registered ITaskStackListener")
+            val proxy = interfaceBinderProxy(itf, listenerBinder)
+            taskManager.javaClass.getMethod("registerTaskStackListener", itf).invoke(taskManager, proxy)
+            Log.i(TAG, "Registered ITaskStackListener (txIds=$txIds)")
         }.onFailure {
             Log.w(TAG, "registerTaskStackListener unavailable", it)
         }
@@ -664,15 +689,16 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         runCatching {
             val am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null)!!
             val stubCls = Class.forName("android.app.IProcessObserver\$Stub")
-            val desc = stubCls.getField("DESCRIPTOR").get(null) as String
-            val txFg = runCatching { stubCls.getField("TRANSACTION_onForegroundActivitiesChanged").getInt(null) }.getOrDefault(-1)
-            val observer = object : Binder() {
+            val itf = Class.forName("android.app.IProcessObserver")
+            val desc = (readStaticField(stubCls, "DESCRIPTOR") as? String) ?: itf.name
+            val txFg = (readStaticField(stubCls, "TRANSACTION_onForegroundActivitiesChanged") as? Int)?.takeIf { it > 0 } ?: -1
+            val observerBinder = object : Binder() {
                 override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
                     if (code == INTERFACE_TRANSACTION) {
                         reply?.writeString(desc)
                         return true
                     }
-                    if (code == txFg) {
+                    if (code in FIRST_CALL_TRANSACTION..LAST_CALL_TRANSACTION && (txFg <= 0 || code == txFg)) {
                         runCatching { data.enforceInterface(desc) }
                         scheduleCheck()
                         return true
@@ -680,12 +706,14 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
                     return super.onTransact(code, data, reply, flags)
                 }
             }
-            val itf = Class.forName("android.app.IProcessObserver")
-            am.javaClass.getMethod("registerProcessObserver", itf).invoke(am, observer)
-            Log.i(TAG, "Registered IProcessObserver")
+            val proxy = interfaceBinderProxy(itf, observerBinder)
+            am.javaClass.getMethod("registerProcessObserver", itf).invoke(am, proxy)
+            Log.i(TAG, "Registered IProcessObserver (txFg=$txFg)")
         }.onFailure {
             Log.w(TAG, "registerProcessObserver unavailable", it)
         }
+
+        handler.post { checkForegroundChange() }
     }
 
     private fun checkForegroundChange() {
@@ -751,81 +779,6 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         }
     }
 
-    private fun startMediaObserver() {
-        val handler = eventHandler ?: return
-        runCatching {
-            val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
-            val listener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-                syncMediaControllers(controllers ?: emptyList())
-            }
-            msm.addOnActiveSessionsChangedListener(listener, null, handler)
-            syncMediaControllers(msm.getActiveSessions(null))
-            Log.i(TAG, "Registered MediaSessionManager listener")
-        }.onFailure {
-            Log.w(TAG, "MediaSessionManager listener unavailable", it)
-        }
-    }
-
-    private fun syncMediaControllers(controllers: List<MediaController>) {
-        val handler = eventHandler ?: return
-        val liveKeys = HashSet<String>()
-        for (controller in controllers) {
-            val pkg = controller.packageName ?: continue
-            val key = "$pkg:${controller.sessionToken}"
-            liveKeys.add(key)
-            if (!mediaCallbacks.containsKey(key)) {
-                val cb = object : MediaController.Callback() {
-                    override fun onPlaybackStateChanged(state: PlaybackState?) {
-                        reportMediaController(controller)
-                    }
-                    override fun onMetadataChanged(metadata: MediaMetadata?) {
-                        reportMediaController(controller)
-                    }
-                }
-                runCatching {
-                    controller.registerCallback(cb, handler)
-                    mediaCallbacks[key] = controller to cb
-                    reportMediaController(controller)
-                }
-            }
-        }
-        val iter = mediaCallbacks.entries.iterator()
-        while (iter.hasNext()) {
-            val entry = iter.next()
-            if (entry.key !in liveKeys) {
-                runCatching { entry.value.first.unregisterCallback(entry.value.second) }
-                iter.remove()
-            }
-        }
-    }
-
-    private fun reportMediaController(controller: MediaController) {
-        val pkg = controller.packageName ?: return
-        val pbState = controller.playbackState?.state ?: PlaybackState.STATE_NONE
-        val stateLabel = when (pbState) {
-            PlaybackState.STATE_PLAYING -> "playing"
-            PlaybackState.STATE_PAUSED -> "paused"
-            PlaybackState.STATE_STOPPED -> "stopped"
-            else -> return
-        }
-        val meta = controller.metadata
-        val title = meta?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim().orEmpty()
-        val artist = meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim().orEmpty()
-        val album = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim().orEmpty()
-        val sig = "$stateLabel|$title|$artist|$album"
-        if (lastMediaState[pkg] == sig) return
-        lastMediaState[pkg] = sig
-        emitShellEvent(
-            "media",
-            "media_$stateLabel",
-            pkg,
-            JSONObject()
-                .put("state", stateLabel)
-                .put("title", title)
-                .put("artist", artist)
-                .put("album", album),
-        )
-    }
 
     fun enableEventPermissions(packageName: String) {
         execCmd("/system/bin/cmd", "notification", "allow_listener", "$packageName/$packageName.AkashicNotificationListenerService")
@@ -1179,7 +1132,8 @@ object ShellHelperHub {
                     val apk = context.applicationInfo.sourceDir
                     val pkg = context.packageName
                     val uid = Process.myUid()
-                    val cmd = "(CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
+                    val cleanup = "for p in /proc/[0-9]*; do case \"\$(tr '\\0' ' ' < \"\$p/cmdline\" 2>/dev/null)\" in \"$pkg:helper\"|\"$pkg:helper \"*) kill -9 \"\${p#/proc/}\" 2>/dev/null;; esac; done"
+                    val cmd = "($cleanup; CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)
                     }
