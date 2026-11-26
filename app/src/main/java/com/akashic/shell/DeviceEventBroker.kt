@@ -552,10 +552,14 @@ object DeviceEventBroker {
                 }
                 val rowId = wdb.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
                 if (rowId >= 0L) {
-                    wdb.execSQL(
-                        "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
-                        arrayOf(MAX_OUTBOX_ROWS)
-                    )
+                    runCatching {
+                        wdb.execSQL(
+                            "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
+                            arrayOf(MAX_OUTBOX_ROWS)
+                        )
+                    }.onFailure {
+                        Log.w(TAG, "trim outbox failed", it)
+                    }
                 }
                 rowId >= 0L
             }

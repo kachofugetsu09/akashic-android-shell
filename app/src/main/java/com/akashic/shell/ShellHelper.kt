@@ -110,7 +110,11 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
     private val taskInfoClass: Class<*> by lazy { Class.forName("android.app.TaskInfo") }
     private val power = DisplayPower()
-    private data class ActiveShellExec(val proc: java.lang.Process, val pgidFile: java.io.File?)
+    private class ActiveShellExec(
+        val proc: java.lang.Process,
+        val pgidFile: java.io.File?,
+        @Volatile var pgid: Long? = null,
+    )
 
     // displayId -> 保活租约到期时间（uptimeMillis）
     private val awakeLeases = HashMap<Int, Long>()
@@ -251,22 +255,21 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
 
     override fun destroy() {
         val execsToKill: List<ActiveShellExec>
-        val pgidsToKill: List<Long>
         synchronized(shellLifecycleLock) {
             shellServiceDestroyed = true
             execsToKill = activeShellExecs.toList()
-            pgidsToKill = activeShellPgids.toList()
             activeShellExecs.clear()
             activeShellPgids.clear()
         }
         execsToKill.forEach { exec ->
-            resolveIsolatedPgid(exec.proc, exec.pgidFile)?.let { pgid ->
-                killProcessGroup(pgid)
+            // 只有主 shell 进程仍在运行才整组清理；若 waitFor() 已正常退出但尚未来得及拿锁移除，绝不误杀其后台子进程。
+            if (exec.proc.isAlive) {
+                val pgid = exec.pgid ?: resolveIsolatedPgid(exec.proc, exec.pgidFile)
+                if (pgid != null) killProcessGroup(pgid)
+                runCatching { if (exec.proc.isAlive) exec.proc.destroyForcibly() }
             }
-            runCatching { if (exec.proc.isAlive) exec.proc.destroyForcibly() }
             runCatching { exec.pgidFile?.delete() }
         }
-        pgidsToKill.forEach { pgid -> killProcessGroup(pgid) }
         releaseAll()
         runCatching { eventThread?.quitSafely() }
         exitProcess(0)
@@ -581,6 +584,7 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         var exitCode = -1
         try {
             pgid = resolveIsolatedPgid(proc, pgidFile)
+            execEntry.pgid = pgid
             if (pgid != null) {
                 var abortRace = false
                 synchronized(shellLifecycleLock) {
@@ -847,6 +851,7 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     private fun isEligibleReapTarget(pid: Long, expectedStartTime: Long): Boolean {
         val verified = ShellProcessWatchdog.readProcessSnapshot(pid) ?: return false
         return verified.state != 'Z' &&
+            !ShellProcessWatchdog.isProtectedProcess(verified) &&
             verified.startTimeTicks == expectedStartTime &&
             verified.uid == ShellProcessWatchdog.SHELL_UID &&
             verified.ppid == 1L &&
