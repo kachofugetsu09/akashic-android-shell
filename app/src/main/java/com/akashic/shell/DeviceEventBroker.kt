@@ -370,6 +370,14 @@ object DeviceEventBroker {
                     tsMs = tsMs,
                 )
             }
+            "device" -> {
+                val title = payload.optString("title").ifEmpty { eventType }
+                val summary = payload.optString("summary").ifEmpty { eventType }
+                onDeviceContextEvent(eventType, title, summary, payload)
+                if (payload.optBoolean("flush", false)) {
+                    flushAsync(eventType)
+                }
+            }
         }
     }
 
