@@ -373,8 +373,16 @@ object DeviceEventBroker {
             "device" -> {
                 val title = payload.optString("title").ifEmpty { eventType }
                 val summary = payload.optString("summary").ifEmpty { eventType }
-                onDeviceContextEvent(eventType, title, summary, payload)
-                if (payload.optBoolean("flush", false)) {
+                val cooldownSuffix = payload.optString("cooldown_key")
+                val wantFlush = payload.optBoolean("flush", false)
+                val cleanPayload = JSONObject(payload.toString()).apply {
+                    remove("flush")
+                    remove("cooldown_key")
+                    remove("title")
+                    remove("summary")
+                }
+                val enqueued = onDeviceContextEvent(eventType, title, summary, cleanPayload, cooldownSuffix)
+                if (enqueued && wantFlush) {
                     flushAsync(eventType)
                 }
             }
@@ -426,24 +434,38 @@ object DeviceEventBroker {
         }
     }
 
-    private fun onDeviceContextEvent(eventType: String, title: String, summary: String, payload: JSONObject) {
+    private fun onDeviceContextEvent(
+        eventType: String,
+        title: String,
+        summary: String,
+        payload: JSONObject,
+        cooldownKeySuffix: String = "",
+    ): Boolean {
         val nowMs = System.currentTimeMillis()
+        var enqueuedAny = false
         for (rule in matchingRules("device", "", nowMs)) {
             if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
-            if (!passCooldown("${rule.id}:$eventType", rule.cooldownS)) continue
+            val cdKey = if (cooldownKeySuffix.isNotEmpty()) "${rule.id}:$eventType:$cooldownKeySuffix" else "${rule.id}:$eventType"
+            if (!passCooldown(cdKey, rule.cooldownS)) continue
+            val outTitle = if (rule.redact == "metadata_only") eventType else title
+            val outSummary = redactText(rule.redact, summary)
+            val outPayload = if (rule.redact == "metadata_only") JSONObject() else payload
+            val idSuffix = if (cooldownKeySuffix.isNotEmpty()) ":$cooldownKeySuffix" else ""
             enqueueEvent(
-                eventId = "dev:${eventType}:${nowMs}",
+                eventId = "dev:${rule.id}:${eventType}:${nowMs}${idSuffix}",
                 tsMs = nowMs,
                 adapter = "device",
                 eventType = eventType,
                 ruleId = rule.id,
                 packageName = "",
-                title = title,
-                summary = summary,
-                payload = payload,
+                title = outTitle,
+                summary = outSummary,
+                payload = outPayload,
                 delivery = rule.delivery,
             )
+            enqueuedAny = true
         }
+        return enqueuedAny
     }
 
     private fun matchingRules(adapter: String, packageName: String, nowMs: Long): List<SubscriptionRule> {

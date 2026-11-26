@@ -11,23 +11,29 @@ internal data class ProcStatSnapshot(
     val comm: String,
     val totalTicks: Long,
     val startTimeTicks: Long,
-    val cmdline: String = "",
+    val hasAkashicMarker: Boolean = false,
 )
 
-internal data class OrphanKillCandidate(
+internal enum class WatchdogAction {
+    REAP_ORPHAN,
+    ALERT_ONLY,
+}
+
+internal data class OrphanFinding(
     val proc: ProcStatSnapshot,
     val cpuPct: Double,
-    val safeToKillGroup: Boolean,
+    val action: WatchdogAction,
 )
 
 internal data class WatchdogDecision(
-    val kills: List<OrphanKillCandidate>,
+    val findings: List<OrphanFinding>,
     val thermalAlertTempTenths: Int?,
 )
 
 internal class ShellProcessWatchdog(
     private val clkTck: Long = 100L,
-    private val minCpuPct: Double = 15.0,
+    private val reapMarkerCpuPct: Double = 25.0,
+    private val alertUnmarkedCpuPct: Double = 50.0,
     private val minSampleIntervalMs: Long = 5_000L,
     private val maxSampleIntervalMs: Long = 600_000L,
     private val thermalThresholdTenths: Int = 420,
@@ -36,73 +42,84 @@ internal class ShellProcessWatchdog(
     private data class ProcKey(val pid: Long, val startTimeTicks: Long)
     private data class PrevSample(val ticks: Long, val atMs: Long)
 
-    private val prevSamples = HashMap<ProcKey, PrevSample>()
-    private var lastThermalAbove = false
-    private var lastThermalAlertMs = Long.MIN_VALUE
+    private val prevOrphans = HashMap<ProcKey, PrevSample>()
+    private val alertedUnknown = HashSet<ProcKey>()
+    private var lastHotMonoMs = Long.MIN_VALUE
+    private var lastThermalAlertMonoMs = Long.MIN_VALUE
 
+    /**
+     * monotonicMs 必须使用单调时钟（如 SystemClock.elapsedRealtime()）。
+     * 仅对两轮采样周期内全程满足 PPID=1 且非受保护、非活跃组的孤儿进程建立 CPU 基线，
+     * 避免把“刚脱离父进程/刚结束命令”之前的正常 CPU 算作孤儿高负载。
+     */
     fun evaluate(
-        nowMs: Long,
+        monotonicMs: Long,
         snapshots: List<ProcStatSnapshot>,
         activePgids: Set<Long>,
         selfPid: Long,
         selfPgid: Long,
         batteryTempTenths: Int?,
     ): WatchdogDecision {
-        val nextMap = HashMap<ProcKey, PrevSample>(snapshots.size)
-        val protectedPgids = HashSet<Long>()
-        protectedPgids.add(selfPgid)
-        for (proc in snapshots) {
-            if (proc.pgrp > 1L && (proc.pid == selfPid || isProtectedProcess(proc) || proc.pgrp in activePgids)) {
-                protectedPgids.add(proc.pgrp)
-            }
-        }
-        val kills = ArrayList<OrphanKillCandidate>()
+        val nextOrphans = HashMap<ProcKey, PrevSample>()
+        val nextAlerted = HashSet<ProcKey>()
+        val findings = ArrayList<OrphanFinding>()
 
         for (proc in snapshots) {
             if (proc.uid != SHELL_UID) continue
             if (proc.pid <= 1L || proc.pid == selfPid) continue
             if (proc.state == 'Z') continue
             if (isProtectedProcess(proc)) continue
-
-            val key = ProcKey(proc.pid, proc.startTimeTicks)
-            nextMap[key] = PrevSample(proc.totalTicks, nowMs)
-
             if (proc.pgrp > 1L && (proc.pgrp in activePgids || proc.pgrp == selfPgid)) continue
             if (proc.ppid != 1L) continue
 
-            val prev = prevSamples[key] ?: continue
-            val dtMs = nowMs - prev.atMs
+            val key = ProcKey(proc.pid, proc.startTimeTicks)
+            nextOrphans[key] = PrevSample(proc.totalTicks, monotonicMs)
+            if (key in alertedUnknown) nextAlerted.add(key)
+
+            val prev = prevOrphans[key] ?: continue
+            val dtMs = monotonicMs - prev.atMs
             if (dtMs < minSampleIntervalMs || dtMs > maxSampleIntervalMs) continue
             val dTicks = proc.totalTicks - prev.ticks
             if (dTicks <= 0L) continue
 
             val cpuPct = (dTicks.toDouble() * 1000.0) / (clkTck.toDouble() * dtMs.toDouble()) * 100.0
-            if (cpuPct >= minCpuPct) {
-                val safeGroup = proc.pgrp > 1L && proc.pgrp !in protectedPgids
-                kills.add(OrphanKillCandidate(proc, cpuPct, safeGroup))
+            if (proc.hasAkashicMarker) {
+                if (cpuPct >= reapMarkerCpuPct) {
+                    findings.add(OrphanFinding(proc, cpuPct, WatchdogAction.REAP_ORPHAN))
+                }
+            } else if (cpuPct >= alertUnmarkedCpuPct && key !in nextAlerted) {
+                nextAlerted.add(key)
+                findings.add(OrphanFinding(proc, cpuPct, WatchdogAction.ALERT_ONLY))
             }
         }
 
-        prevSamples.clear()
-        prevSamples.putAll(nextMap)
+        prevOrphans.clear()
+        prevOrphans.putAll(nextOrphans)
+        alertedUnknown.clear()
+        alertedUnknown.addAll(nextAlerted)
 
         var thermalAlert: Int? = null
         if (batteryTempTenths != null && batteryTempTenths >= thermalThresholdTenths) {
-            val cooldownReady = lastThermalAlertMs == Long.MIN_VALUE || (nowMs - lastThermalAlertMs) >= thermalCooldownMs
-            if (lastThermalAbove && cooldownReady) {
+            val consecutive = lastHotMonoMs != Long.MIN_VALUE &&
+                (monotonicMs - lastHotMonoMs) in minSampleIntervalMs..maxSampleIntervalMs
+            val cooldownReady = lastThermalAlertMonoMs == Long.MIN_VALUE ||
+                (monotonicMs - lastThermalAlertMonoMs) >= thermalCooldownMs
+            if (consecutive && cooldownReady) {
                 thermalAlert = batteryTempTenths
-                lastThermalAlertMs = nowMs
+                lastThermalAlertMonoMs = monotonicMs
             }
-            lastThermalAbove = true
+            lastHotMonoMs = monotonicMs
         } else {
-            lastThermalAbove = false
+            lastHotMonoMs = Long.MIN_VALUE
         }
 
-        return WatchdogDecision(kills = kills, thermalAlertTempTenths = thermalAlert)
+        return WatchdogDecision(findings = findings, thermalAlertTempTenths = thermalAlert)
     }
 
     companion object {
         const val SHELL_UID = 2000
+        const val EXEC_ENV_KEY = "AKASHIC_SHELL_EXEC"
+        const val EXEC_ENV_ENTRY = "$EXEC_ENV_KEY=1"
 
         private val PROTECTED_COMMS = setOf(
             "adbd",
@@ -114,14 +131,9 @@ internal class ShellProcessWatchdog(
             "main",
         )
 
-        private val CLEANUP_ORPHAN_COMMS = listOf(
-            "tr", "grep", "egrep", "fgrep", "sed", "awk", "cat", "sh", "top", "dumpsys", "logcat", "sleep",
-        )
-
         fun isProtectedProcess(proc: ProcStatSnapshot): Boolean {
             if (proc.comm in PROTECTED_COMMS) return true
-            if (proc.cmdline.contains(":helper") || proc.comm.endsWith(":helper")) return true
-            if (proc.cmdline.startsWith("adbd") || proc.cmdline == "abb" || proc.cmdline == "abb_exec") return true
+            if (proc.comm.endsWith(":helper")) return true
             return false
         }
 
@@ -135,7 +147,12 @@ internal class ShellProcessWatchdog(
             return null
         }
 
-        fun parseProcStat(pid: Long, statLine: String, uid: Int, cmdline: String = ""): ProcStatSnapshot? {
+        fun parseProcStat(
+            pid: Long,
+            statLine: String,
+            uid: Int,
+            hasAkashicMarker: Boolean = false,
+        ): ProcStatSnapshot? {
             val lParen = statLine.indexOf('(')
             val rParen = statLine.lastIndexOf(')')
             if (lParen < 0 || rParen <= lParen || rParen + 2 >= statLine.length) return null
@@ -157,8 +174,42 @@ internal class ShellProcessWatchdog(
                 comm = comm,
                 totalTicks = utime + stime,
                 startTimeTicks = startTime,
-                cmdline = cmdline,
+                hasAkashicMarker = hasAkashicMarker,
             )
+        }
+
+        fun hasEnvironEntry(environBytes: ByteArray, entry: String = EXEC_ENV_ENTRY): Boolean {
+            if (environBytes.isEmpty()) return false
+            val target = entry.toByteArray(Charsets.UTF_8)
+            var start = 0
+            while (start < environBytes.size) {
+                var end = start
+                while (end < environBytes.size && environBytes[end] != 0.toByte()) {
+                    end++
+                }
+                if (end - start == target.size) {
+                    var match = true
+                    for (i in target.indices) {
+                        if (environBytes[start + i] != target[i]) {
+                            match = false
+                            break
+                        }
+                    }
+                    if (match) return true
+                }
+                start = end + 1
+            }
+            return false
+        }
+
+        fun readProcessSnapshot(pid: Long, procRoot: File = File("/proc")): ProcStatSnapshot? {
+            if (pid <= 1L) return null
+            val entry = File(procRoot, pid.toString())
+            val statusText = runCatching { File(entry, "status").readText() }.getOrNull() ?: return null
+            val uid = parseProcUid(statusText) ?: return null
+            val statLine = runCatching { File(entry, "stat").readText() }.getOrNull() ?: return null
+            val marked = runCatching { hasEnvironEntry(File(entry, "environ").readBytes()) }.getOrDefault(false)
+            return parseProcStat(pid, statLine, uid, marked)
         }
 
         fun scanShellProcesses(procRoot: File = File("/proc")): List<ProcStatSnapshot> {
@@ -176,7 +227,11 @@ internal class ShellProcessWatchdog(
                         String(raw, Charsets.UTF_8).replace('\u0000', ' ').trim()
                     }
                 }.getOrDefault("")
-                parseProcStat(pid, statLine, uid, cmdline)?.let { out.add(it) }
+                if (cmdline.contains(":helper") || cmdline.startsWith("adbd") || cmdline == "abb" || cmdline == "abb_exec") {
+                    continue
+                }
+                val marked = runCatching { hasEnvironEntry(File(entry, "environ").readBytes()) }.getOrDefault(false)
+                parseProcStat(pid, statLine, uid, marked)?.let { out.add(it) }
             }
             return out
         }
@@ -197,13 +252,12 @@ internal class ShellProcessWatchdog(
         fun readBatteryTempTenths(tempFile: File = File("/sys/class/power_supply/battery/temp")): Int? =
             runCatching { tempFile.readText().trim().toIntOrNull() }.getOrNull()
 
+        // 只清理旧的 $pkg:helper 进程：用单次 ps + awk 精确匹配 argv[0]，
+        // 不再遍历全系统 proc cmdline 调 tr，也不误杀用户的其他 shell 后台任务。
         fun buildHelperCleanupCommand(pkg: String): String {
             require(pkg.matches(Regex("[A-Za-z0-9_.]+"))) { "非法包名: $pkg" }
-            val commCond = CLEANUP_ORPHAN_COMMS.joinToString("||") { "cmd==\"$it\"" }
-            // 单次 ps + awk 精确清理旧 :helper 及 PPID=1 孤儿工具进程，不再逐个打开 /proc/*/cmdline 调 tr。
             return "ps -Ao pid,ppid,user,args 2>/dev/null | " +
-                "awk -v pkg='$pkg' '\$3==\"shell\" {cmd=\$4; sub(/^.*\\//, \"\", cmd); " +
-                "if (\$4==(pkg \":helper\") || (\$2==1 && ($commCond))) print \$1}' | " +
+                "awk -v pkg='$pkg' -v self=\$\$ 'NR>1 && \$1!=self && \$3==\"shell\" && \$4==(pkg \":helper\") {print \$1}' | " +
                 "while read -r opid; do kill -9 \"\$opid\" 2>/dev/null; done"
         }
     }
