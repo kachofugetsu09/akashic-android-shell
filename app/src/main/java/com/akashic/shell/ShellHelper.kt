@@ -110,8 +110,23 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
     private val taskInfoClass: Class<*> by lazy { Class.forName("android.app.TaskInfo") }
     private val power = DisplayPower()
+    private class ActiveShellExec(
+        val proc: java.lang.Process,
+        val pgidFile: java.io.File?,
+        @Volatile var pgid: Long? = null,
+    )
+
     // displayId -> 保活租约到期时间（uptimeMillis）
     private val awakeLeases = HashMap<Int, Long>()
+    private val shellLifecycleLock = Any()
+    private var shellServiceDestroyed = false
+    private val activeShellExecs = HashSet<ActiveShellExec>()
+    private val activeShellPgids = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+    private val selfPid: Long = Process.myPid().toLong()
+    private val selfPgid: Long = runCatching {
+        val stat = java.io.File("/proc/$selfPid/stat").readText()
+        ShellProcessWatchdog.parseProcStat(selfPid, stat, ShellProcessWatchdog.SHELL_UID)?.pgrp ?: selfPid
+    }.getOrDefault(selfPid)
     @Volatile private var eventSink: IAkashicEventSink? = null
     private var observersStarted = false
     private val observerLock = Any()
@@ -239,7 +254,24 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
     }
 
     override fun destroy() {
+        val execsToKill: List<ActiveShellExec>
+        synchronized(shellLifecycleLock) {
+            shellServiceDestroyed = true
+            execsToKill = activeShellExecs.toList()
+            activeShellExecs.clear()
+            activeShellPgids.clear()
+        }
+        execsToKill.forEach { exec ->
+            // 只有主 shell 进程仍在运行才整组清理；若 waitFor() 已正常退出但尚未来得及拿锁移除，绝不误杀其后台子进程。
+            if (exec.proc.isAlive) {
+                val pgid = exec.pgid ?: resolveIsolatedPgid(exec.proc, exec.pgidFile)
+                if (pgid != null) killProcessGroup(pgid)
+                runCatching { if (exec.proc.isAlive) exec.proc.destroyForcibly() }
+            }
+            runCatching { exec.pgidFile?.delete() }
+        }
         releaseAll()
+        runCatching { eventThread?.quitSafely() }
         exitProcess(0)
     }
 
@@ -502,9 +534,32 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         val clampedTimeout = timeoutMs.coerceIn(1_000, 60_000).toLong()
         val clampedMax = maxBytes.coerceIn(1024, 256 * 1024)
         val t0 = android.os.SystemClock.uptimeMillis()
-        val proc = ProcessBuilder("/system/bin/sh", "-c", command)
+        val pgidFile = runCatching {
+            val tmpDir = java.io.File("/data/local/tmp")
+            if (tmpDir.isDirectory && tmpDir.canWrite()) {
+                java.io.File.createTempFile("akashic_pgid_", ".tmp", tmpDir)
+            } else null
+        }.getOrNull()
+        val wrapper = if (pgidFile != null) {
+            "printf '%s' \"\$\$\" > \"\$AKASHIC_PGID_FILE\" 2>/dev/null; exec /system/bin/sh -c \"\$1\""
+        } else {
+            "exec /system/bin/sh -c \"\$1\""
+        }
+        val pb = ProcessBuilder("/system/bin/setsid", "/system/bin/sh", "-c", wrapper, "akashic-sh", command)
             .redirectErrorStream(true)
-            .start()
+        pb.environment()[ShellProcessWatchdog.EXEC_ENV_KEY] = "1"
+        if (pgidFile != null) {
+            pb.environment()["AKASHIC_PGID_FILE"] = pgidFile.absolutePath
+        }
+        val proc: java.lang.Process
+        val execEntry: ActiveShellExec
+        synchronized(shellLifecycleLock) {
+            check(!shellServiceDestroyed) { "Helper 服务正在退出" }
+            proc = pb.start()
+            execEntry = ActiveShellExec(proc, pgidFile)
+            activeShellExecs.add(execEntry)
+        }
+        var pgid: Long? = null
         val out = java.io.ByteArrayOutputStream()
         var truncated = false
         val readerThread = Thread {
@@ -525,12 +580,48 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
             }
         }
         readerThread.start()
-        val finished = proc.waitFor(clampedTimeout, java.util.concurrent.TimeUnit.MILLISECONDS)
-        if (!finished) {
-            proc.destroyForcibly()
+        var finished = false
+        var exitCode = -1
+        try {
+            pgid = resolveIsolatedPgid(proc, pgidFile)
+            execEntry.pgid = pgid
+            if (pgid != null) {
+                var abortRace = false
+                synchronized(shellLifecycleLock) {
+                    if (shellServiceDestroyed) abortRace = true else activeShellPgids.add(pgid)
+                }
+                if (abortRace) {
+                    killProcessGroup(pgid)
+                    proc.destroyForcibly()
+                    error("Helper 服务正在退出")
+                }
+            }
+            finished = proc.waitFor(clampedTimeout, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!finished) {
+                pgid = pgid ?: resolveIsolatedPgid(proc, pgidFile)
+                if (pgid != null) killProcessGroup(pgid)
+                proc.destroyForcibly()
+            } else {
+                // 主命令已正常结束，立刻解除生命周期追踪，避免后续 reader join 期间被 destroy() 误杀后台子进程。
+                synchronized(shellLifecycleLock) {
+                    activeShellExecs.remove(execEntry)
+                    if (pgid != null) activeShellPgids.remove(pgid)
+                }
+                exitCode = proc.exitValue()
+            }
+            readerThread.join(1_500L)
+        } finally {
+            val cleanupPgid = if (finished) pgid else (pgid ?: resolveIsolatedPgid(proc, pgidFile))
+            synchronized(shellLifecycleLock) {
+                activeShellExecs.remove(execEntry)
+                if (cleanupPgid != null) activeShellPgids.remove(cleanupPgid)
+            }
+            if (!finished && proc.isAlive) {
+                if (cleanupPgid != null) killProcessGroup(cleanupPgid)
+                proc.destroyForcibly()
+            }
+            runCatching { pgidFile?.delete() }
         }
-        readerThread.join(1_500L)
-        val exitCode = if (finished) proc.exitValue() else -1
         val elapsed = android.os.SystemClock.uptimeMillis() - t0
         return org.json.JSONObject()
             .put("exit_code", exitCode)
@@ -539,6 +630,66 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
             .put("timed_out", !finished)
             .put("elapsed_ms", elapsed)
             .toString()
+    }
+
+    private fun resolveIsolatedPgid(proc: java.lang.Process, pgidFile: java.io.File?): Long? {
+        var candidate: Long? = null
+        if (pgidFile != null) {
+            val deadline = SystemClock.uptimeMillis() + 60L
+            while (SystemClock.uptimeMillis() < deadline) {
+                val parsed = runCatching { pgidFile.readText().trim().toLongOrNull() }.getOrNull()
+                if (parsed != null && parsed > 1L) {
+                    candidate = parsed
+                    break
+                }
+                if (!proc.isAlive) break
+                SystemClock.sleep(5L)
+            }
+            if (candidate == null) {
+                candidate = runCatching { pgidFile.readText().trim().toLongOrNull() }.getOrNull()?.takeIf { it > 1L }
+            }
+        }
+        if (candidate == null) {
+            candidate = readProcessPid(proc)
+        }
+        val pgid = candidate ?: return null
+        if (pgid <= 1L || pgid == selfPgid) return null
+        // 若进程仍在运行，通过 /proc/<pid>/stat 验证 setsid 确实建立了独立进程组。
+        val snap = ShellProcessWatchdog.readProcessSnapshot(pgid)
+        if (snap != null && snap.pgrp != pgid) {
+            Log.w(TAG, "setsid isolation check failed: pid=$pgid pgrp=${snap.pgrp}")
+            return null
+        }
+        return pgid
+    }
+
+    private fun readProcessPid(proc: java.lang.Process): Long? {
+        runCatching {
+            val v = proc.javaClass.getMethod("pid").invoke(proc)
+            if (v is Long && v > 0L) return v
+            if (v is Int && v > 0) return v.toLong()
+        }
+        return runCatching {
+            val f = proc.javaClass.getDeclaredField("pid").apply { isAccessible = true }
+            when (val v = f.get(proc)) {
+                is Int -> v.toLong().takeIf { it > 0L }
+                is Long -> v.takeIf { it > 0L }
+                else -> null
+            }
+        }.getOrNull()
+    }
+
+    private fun killProcessGroup(pgid: Long) {
+        if (pgid <= 1L || pgid == selfPgid) return
+        if (!ShellProcessWatchdog.hasLiveProcessInGroup(pgid)) return
+        runCatching { execCmd("/system/bin/kill", "-TERM", "-$pgid") }
+        val deadline = SystemClock.uptimeMillis() + 180L
+        while (SystemClock.uptimeMillis() < deadline && ShellProcessWatchdog.hasLiveProcessInGroup(pgid)) {
+            SystemClock.sleep(30L)
+        }
+        if (ShellProcessWatchdog.hasLiveProcessInGroup(pgid)) {
+            runCatching { execCmd("/system/bin/kill", "-KILL", "-$pgid") }
+        }
     }
 
     override fun readFile(path: String, offset: Long, maxBytes: Int): String {
@@ -615,6 +766,97 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         }
         startForegroundObservers()
         startAppOpsObserver()
+        startShellWatchdog()
+    }
+
+    private fun startShellWatchdog() {
+        val h = eventHandler ?: return
+        val watchdog = ShellProcessWatchdog()
+
+        val task = object : Runnable {
+            override fun run() {
+                runCatching {
+                    val monoMs = SystemClock.elapsedRealtime()
+                    val snaps = ShellProcessWatchdog.scanShellProcesses()
+                    val temp = ShellProcessWatchdog.readBatteryTempTenths()
+                    val activeSnapshot = activeShellPgids.toSet()
+                    val decision = watchdog.evaluate(monoMs, snaps, activeSnapshot, selfPid, selfPgid, temp)
+                    for (finding in decision.findings) {
+                        val p = finding.proc
+                        val cpuStr = String.format(java.util.Locale.US, "%.1f", finding.cpuPct)
+                        val cooldownKey = "${p.pid}:${p.startTimeTicks}"
+                        when (finding.action) {
+                            WatchdogAction.REAP_ORPHAN -> {
+                                // SIGTERM 与 SIGKILL 前均做完整资格复核，避免 PID 复用或宽限期内 exec 成新进程后误杀。
+                                if (!isEligibleReapTarget(p.pid, p.startTimeTicks)) {
+                                    continue
+                                }
+                                Log.w(TAG, "Reaping orphan shell process pid=${p.pid} comm=${p.comm} cpu=$cpuStr%")
+                                execCmd("/system/bin/kill", "-TERM", p.pid.toString())
+                                val deadline = SystemClock.uptimeMillis() + 120L
+                                while (SystemClock.uptimeMillis() < deadline) {
+                                    val check = ShellProcessWatchdog.readProcessSnapshot(p.pid)
+                                    if (check == null || check.state == 'Z' || check.startTimeTicks != p.startTimeTicks) break
+                                    SystemClock.sleep(30L)
+                                }
+                                if (isEligibleReapTarget(p.pid, p.startTimeTicks)) {
+                                    execCmd("/system/bin/kill", "-KILL", p.pid.toString())
+                                    SystemClock.sleep(30L)
+                                }
+                                val after = ShellProcessWatchdog.readProcessSnapshot(p.pid)
+                                val reaped = after == null || after.state == 'Z' || after.startTimeTicks != p.startTimeTicks
+                                if (reaped) {
+                                    val payload = JSONObject()
+                                        .put("title", "端侧清理卡死进程：${p.comm}")
+                                        .put("summary", "shell_health:orphan_reaped pid=${p.pid} comm=${p.comm} cpu=$cpuStr%")
+                                        .put("cooldown_key", cooldownKey)
+                                        .put("pid", p.pid)
+                                        .put("comm", p.comm)
+                                        .put("cpu_pct", Math.round(finding.cpuPct * 10.0) / 10.0)
+                                        .put("flush", true)
+                                    emitShellEvent("device", "shell_orphan_reaped", "", payload)
+                                }
+                            }
+                            WatchdogAction.ALERT_ONLY -> {
+                                val payload = JSONObject()
+                                    .put("title", "手机 UID 2000 孤儿高占用：${p.comm}")
+                                    .put("summary", "shell_health:high_cpu pid=${p.pid} comm=${p.comm} cpu=$cpuStr%")
+                                    .put("cooldown_key", cooldownKey)
+                                    .put("pid", p.pid)
+                                    .put("comm", p.comm)
+                                    .put("cpu_pct", Math.round(finding.cpuPct * 10.0) / 10.0)
+                                    .put("flush", true)
+                                emitShellEvent("device", "shell_orphan_high_cpu", "", payload)
+                            }
+                        }
+                    }
+                    decision.thermalAlertTempTenths?.let { t ->
+                        val degStr = String.format(java.util.Locale.US, "%.1f", t / 10.0)
+                        val payload = JSONObject()
+                            .put("title", "手机电池持续高温：${degStr}°C")
+                            .put("summary", "shell_health:thermal_high temp=${degStr}C")
+                            .put("temp_tenths", t)
+                            .put("flush", true)
+                        emitShellEvent("device", "thermal_high", "", payload)
+                    }
+                }.onFailure {
+                    Log.w(TAG, "shell watchdog tick failed", it)
+                }
+                h.postDelayed(this, WATCHDOG_INTERVAL_MS)
+            }
+        }
+        h.postDelayed(task, WATCHDOG_INITIAL_DELAY_MS)
+    }
+
+    private fun isEligibleReapTarget(pid: Long, expectedStartTime: Long): Boolean {
+        val verified = ShellProcessWatchdog.readProcessSnapshot(pid) ?: return false
+        return verified.state != 'Z' &&
+            !ShellProcessWatchdog.isProtectedProcess(verified) &&
+            verified.startTimeTicks == expectedStartTime &&
+            verified.uid == ShellProcessWatchdog.SHELL_UID &&
+            verified.ppid == 1L &&
+            verified.hasAkashicMarker &&
+            (verified.pgrp <= 1L || verified.pgrp !in activeShellPgids)
     }
 
     private fun readStaticField(cls: Class<*>, name: String): Any? =
@@ -800,11 +1042,16 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         }
     }
 
-    private fun execCmd(vararg cmd: String): Int = try {
-        val p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
-        if (p.waitFor(8, TimeUnit.SECONDS)) p.exitValue() else { p.destroyForcibly(); -1 }
-    } catch (_: Throwable) {
-        -1
+    private fun execCmd(vararg cmd: String): Int {
+        var p: java.lang.Process? = null
+        return try {
+            p = ProcessBuilder(*cmd).redirectErrorStream(true).start()
+            if (p.waitFor(8, TimeUnit.SECONDS)) p.exitValue() else { p.destroyForcibly(); -1 }
+        } catch (_: Throwable) {
+            -1
+        } finally {
+            if (p?.isAlive == true) p.destroyForcibly()
+        }
     }
 
     companion object {
@@ -813,6 +1060,8 @@ class AkashicShellService(private val allowedUid: Int) : IAkashicShell.Stub() {
         private const val REQUIRED_DISPLAY_FLAGS = (1 shl 7) or (1 shl 8) or (1 shl 9) or (1 shl 11) or (1 shl 12)
         private const val KEEP_AWAKE_INTERVAL_MS = 4_000L
         private const val KEEP_AWAKE_LEASE_MS = 5 * 60_000L
+        private const val WATCHDOG_INITIAL_DELAY_MS = 30_000L
+        private const val WATCHDOG_INTERVAL_MS = 180_000L
     }
 }
 
@@ -1132,7 +1381,7 @@ object ShellHelperHub {
                     val apk = context.applicationInfo.sourceDir
                     val pkg = context.packageName
                     val uid = Process.myUid()
-                    val cleanup = "for p in /proc/[0-9]*; do case \"\$(tr '\\0' ' ' < \"\$p/cmdline\" 2>/dev/null)\" in \"$pkg:helper\"|\"$pkg:helper \"*) kill -9 \"\${p#/proc/}\" 2>/dev/null;; esac; done"
+                    val cleanup = ShellProcessWatchdog.buildHelperCleanupCommand(pkg)
                     val cmd = "($cleanup; CLASSPATH='$apk' nohup setsid app_process /system/bin --nice-name='$pkg:helper' com.akashic.shell.HelperMain '$pkg' $uid >/dev/null 2>&1 &); sleep 1"
                     conn.exec(cmd).use { _ ->
                         latch.await(8, TimeUnit.SECONDS)

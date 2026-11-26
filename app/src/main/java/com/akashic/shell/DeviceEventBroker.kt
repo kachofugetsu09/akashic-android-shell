@@ -370,6 +370,22 @@ object DeviceEventBroker {
                     tsMs = tsMs,
                 )
             }
+            "device" -> {
+                val title = payload.optString("title").ifEmpty { eventType }
+                val summary = payload.optString("summary").ifEmpty { eventType }
+                val cooldownSuffix = payload.optString("cooldown_key")
+                val wantFlush = payload.optBoolean("flush", false)
+                val cleanPayload = JSONObject(payload.toString()).apply {
+                    remove("flush")
+                    remove("cooldown_key")
+                    remove("title")
+                    remove("summary")
+                }
+                val enqueued = onDeviceContextEvent(eventType, title, summary, cleanPayload, cooldownSuffix)
+                if (enqueued && wantFlush) {
+                    flushAsync(eventType)
+                }
+            }
         }
     }
 
@@ -418,24 +434,39 @@ object DeviceEventBroker {
         }
     }
 
-    private fun onDeviceContextEvent(eventType: String, title: String, summary: String, payload: JSONObject) {
+    private fun onDeviceContextEvent(
+        eventType: String,
+        title: String,
+        summary: String,
+        payload: JSONObject,
+        cooldownKeySuffix: String = "",
+    ): Boolean {
         val nowMs = System.currentTimeMillis()
+        var enqueuedAny = false
         for (rule in matchingRules("device", "", nowMs)) {
             if (!EventRuleMatcher.matchesContent(rule.titleRegex, rule.textRegex, title, summary)) continue
-            if (!passCooldown("${rule.id}:$eventType", rule.cooldownS)) continue
-            enqueueEvent(
-                eventId = "dev:${eventType}:${nowMs}",
+            val cdKey = if (cooldownKeySuffix.isNotEmpty()) "${rule.id}:$eventType:$cooldownKeySuffix" else "${rule.id}:$eventType"
+            if (!passCooldown(cdKey, rule.cooldownS)) continue
+            val outTitle = if (rule.redact == "metadata_only") eventType else title
+            val outSummary = redactText(rule.redact, summary)
+            val outPayload = if (rule.redact == "metadata_only") JSONObject() else payload
+            val idSuffix = if (cooldownKeySuffix.isNotEmpty()) ":$cooldownKeySuffix" else ""
+            if (enqueueEvent(
+                eventId = "dev:${rule.id}:${eventType}:${nowMs}${idSuffix}",
                 tsMs = nowMs,
                 adapter = "device",
                 eventType = eventType,
                 ruleId = rule.id,
                 packageName = "",
-                title = title,
-                summary = summary,
-                payload = payload,
+                title = outTitle,
+                summary = outSummary,
+                payload = outPayload,
                 delivery = rule.delivery,
-            )
+            )) {
+                enqueuedAny = true
+            }
         }
+        return enqueuedAny
     }
 
     private fun matchingRules(adapter: String, packageName: String, nowMs: Long): List<SubscriptionRule> {
@@ -494,8 +525,8 @@ object DeviceEventBroker {
         summary: String,
         payload: JSONObject,
         delivery: String,
-    ) {
-        val ctx = appContext ?: return
+    ): Boolean {
+        val ctx = appContext ?: return false
         val helper = db ?: EventDbHelper(ctx).also { db = it }
         val full = JSONObject()
             .put("event_id", eventId)
@@ -508,7 +539,7 @@ object DeviceEventBroker {
             .put("summary", summary.take(1000))
             .put("payload", payload)
 
-        runCatching {
+        val inserted = runCatching {
             helper.writableDatabase.use { wdb ->
                 val cv = ContentValues().apply {
                     put("event_id", eventId)
@@ -519,19 +550,27 @@ object DeviceEventBroker {
                     put("payload_json", full.toString())
                     put("created_at_ms", System.currentTimeMillis())
                 }
-                wdb.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
-                wdb.execSQL(
-                    "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
-                    arrayOf(MAX_OUTBOX_ROWS)
-                )
+                val rowId = wdb.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+                if (rowId >= 0L) {
+                    runCatching {
+                        wdb.execSQL(
+                            "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
+                            arrayOf(MAX_OUTBOX_ROWS)
+                        )
+                    }.onFailure {
+                        Log.w(TAG, "trim outbox failed", it)
+                    }
+                }
+                rowId >= 0L
             }
         }.onFailure {
             Log.w(TAG, "enqueueEvent failed", it)
-        }
+        }.getOrDefault(false)
 
-        if (delivery == "realtime") {
+        if (inserted && delivery == "realtime") {
             scheduleDebouncedFlush("realtime", 500L)
         }
+        return inserted
     }
 
     fun flushAsync(reason: String) {
