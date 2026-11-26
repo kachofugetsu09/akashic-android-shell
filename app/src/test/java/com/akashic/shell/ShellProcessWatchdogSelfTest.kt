@@ -142,5 +142,30 @@ object ShellProcessWatchdogSelfTest {
         check(cmd.contains("com.akashic.shell") && cmd.contains(":helper"))
         check(cmd.contains("\$1!=self")) { "must exclude current shell pid" }
         check(!cmd.contains("logcat") && !cmd.contains("sleep")) { "must not target unrelated user shell tasks" }
+
+        // 若测试环境有 awk，直接喂入真实 ps -Ao pid,ppid,user,args 样例验证只输出旧 :helper。
+        val awkPath = listOf("/usr/bin/awk", "/bin/awk", "/system/bin/awk").firstOrNull { File(it).canExecute() }
+        if (awkPath != null) {
+            val awkIdx = cmd.indexOf("awk ")
+            val pipeAfterAwk = cmd.indexOf(" | while")
+            val awkCmd = cmd.substring(awkIdx, pipeAfterAwk).replace("self=\$\$", "self=25005")
+            val samplePs = listOf(
+                "  PID  PPID USER         ARGS",
+                "24831     1 shell        com.akashic.shell:helper",
+                "24832     1 shell        com.akashic.shell:helper --extra",
+                "25001     1 shell        logcat -v threadtime",
+                "25002     1 shell        toybox sleep 30",
+                "25003     1 shell        /system/bin/sh -c ps -Ao pid,ppid,user,args | awk -v pkg=com.akashic.shell",
+                "25004     1 u0_a437      com.akashic.shell:helper",
+                "25005 23000 shell        com.akashic.shell:helper",
+            ).joinToString("\n")
+            val p = ProcessBuilder("/bin/sh", "-c", awkCmd)
+                .redirectErrorStream(true)
+                .start()
+            p.outputStream.use { it.write(samplePs.toByteArray()) }
+            val out = p.inputStream.bufferedReader().readText().trim().lines().filter { it.isNotEmpty() }
+            check(p.waitFor() == 0)
+            check(out == listOf("24831", "24832")) { "expected [24831, 24832], got $out (cmd=$awkCmd)" }
+        }
     }
 }

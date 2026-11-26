@@ -451,7 +451,7 @@ object DeviceEventBroker {
             val outSummary = redactText(rule.redact, summary)
             val outPayload = if (rule.redact == "metadata_only") JSONObject() else payload
             val idSuffix = if (cooldownKeySuffix.isNotEmpty()) ":$cooldownKeySuffix" else ""
-            enqueueEvent(
+            if (enqueueEvent(
                 eventId = "dev:${rule.id}:${eventType}:${nowMs}${idSuffix}",
                 tsMs = nowMs,
                 adapter = "device",
@@ -462,8 +462,9 @@ object DeviceEventBroker {
                 summary = outSummary,
                 payload = outPayload,
                 delivery = rule.delivery,
-            )
-            enqueuedAny = true
+            )) {
+                enqueuedAny = true
+            }
         }
         return enqueuedAny
     }
@@ -524,8 +525,8 @@ object DeviceEventBroker {
         summary: String,
         payload: JSONObject,
         delivery: String,
-    ) {
-        val ctx = appContext ?: return
+    ): Boolean {
+        val ctx = appContext ?: return false
         val helper = db ?: EventDbHelper(ctx).also { db = it }
         val full = JSONObject()
             .put("event_id", eventId)
@@ -538,7 +539,7 @@ object DeviceEventBroker {
             .put("summary", summary.take(1000))
             .put("payload", payload)
 
-        runCatching {
+        val inserted = runCatching {
             helper.writableDatabase.use { wdb ->
                 val cv = ContentValues().apply {
                     put("event_id", eventId)
@@ -549,19 +550,23 @@ object DeviceEventBroker {
                     put("payload_json", full.toString())
                     put("created_at_ms", System.currentTimeMillis())
                 }
-                wdb.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
-                wdb.execSQL(
-                    "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
-                    arrayOf(MAX_OUTBOX_ROWS)
-                )
+                val rowId = wdb.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_IGNORE)
+                if (rowId >= 0L) {
+                    wdb.execSQL(
+                        "DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM outbox ORDER BY created_at_ms DESC LIMIT -1 OFFSET ?)",
+                        arrayOf(MAX_OUTBOX_ROWS)
+                    )
+                }
+                rowId >= 0L
             }
         }.onFailure {
             Log.w(TAG, "enqueueEvent failed", it)
-        }
+        }.getOrDefault(false)
 
-        if (delivery == "realtime") {
+        if (inserted && delivery == "realtime") {
             scheduleDebouncedFlush("realtime", 500L)
         }
+        return inserted
     }
 
     fun flushAsync(reason: String) {
